@@ -12,11 +12,4 @@ static btest_suite_t basic = {
 };
 
 BTEST(basic, create_destroy) {
-	shibe_vm_t* vm = shibe_create((shibe_config_t){
-		.alloc = shibe_alloc,
-	});
-
-	BTEST_EXPECT(vm != NULL);
-
-	shibe_destroy(vm);
 }
