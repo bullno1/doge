@@ -115,10 +115,10 @@ SHIBE_API void
 shibe_store(shibe_vm_t* vm, shibe_cell_t vm_addr, shibe_cell_t value);
 
 SHIBE_API void
-shibe_copy_to_vm  (shibe_vm_t* vm, shibe_cell_t vm_addr, const shibe_cell_t* host_addr, uint32_t num_cells);
+shibe_copy_to_vm  (shibe_vm_t* vm, shibe_cell_t vm_addr, const void* host_addr, uint32_t num_bytes);
 
 SHIBE_API void
-shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       shibe_cell_t* host_addr, uint32_t num_cells);
+shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       void* host_addr, uint32_t num_bytes);
 
 SHIBE_API void
 shibe_push(shibe_vm_t* vm, shibe_cell_t item);

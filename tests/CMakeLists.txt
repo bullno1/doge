@@ -2,6 +2,7 @@ set(SOURCES
 	"main.c"
 
 	"shibe/basic.c"
+	"shibe/str.c"
 )
 
 add_executable(doge-tests "${SOURCES}")

@@ -1,5 +1,6 @@
 set(SOURCES
 	"src/alloc.c"
+	"src/str.c"
 )
 add_library(shibe-aux STATIC "${SOURCES}")
 target_include_directories(shibe-aux PUBLIC "include")

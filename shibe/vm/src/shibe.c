@@ -150,7 +150,6 @@ shibe_alloc(shibe_vm_t* vm, shibe_mem_region_t region, shibe_cell_t num_cells) {
 	if (num_cells.i32 < 0) {
 		shibe_panic(vm, &(shibe_panic_t){
 			.error = SHIBE_ERR_INVALID,
-			.arg = num_cells,
 		});
 		return SHIBE_ZERO;
 	}
@@ -203,19 +202,75 @@ shibe_store(shibe_vm_t* vm, shibe_cell_t vm_addr, shibe_cell_t value) {
 	}
 }
 
-void
-shibe_copy_to_vm  (shibe_vm_t* vm, shibe_cell_t vm_addr, const shibe_cell_t* host_addr, uint32_t num_cells) {
-	for (uint32_t i = 0; i < num_cells && !shibe_panicked(vm); ++i) {
-		shibe_store(vm, (shibe_cell_t){ vm_addr.u32 + i}, host_addr[i]);
+// Bytes sit in a cell in little-endian order on every host so that VM memory is
+// portable and agrees with SHIBE_OP_BFETCH / SHIBE_OP_BSTORE.
+// Going through bytes also means the host buffer needs no alignment.
+static inline shibe_cell_t
+shibe_cell_patch_le(shibe_cell_t value, const char* src, uint32_t num_bytes) {
+	const unsigned char* bytes = (const unsigned char*)src;
+	for (uint32_t i = 0; i < num_bytes; ++i) {
+		uint32_t shift = i * 8;
+		value.u32 =
+			(value.u32 & ~((uint32_t)0xff << shift))
+			| ((uint32_t)bytes[i] << shift);
+	}
+	return value;
+}
+
+static inline void
+shibe_cell_extract_le(char* dst, shibe_cell_t value, uint32_t num_bytes) {
+	unsigned char* bytes = (unsigned char*)dst;
+	for (uint32_t i = 0; i < num_bytes; ++i) {
+		bytes[i] = (unsigned char)(value.u32 >> (i * 8));
 	}
 }
 
 void
-shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       shibe_cell_t* host_addr, uint32_t num_cells) {
-	for (uint32_t i = 0; i < num_cells && !shibe_panicked(vm); ++i) {
+shibe_copy_to_vm  (shibe_vm_t* vm, shibe_cell_t vm_addr, const void* host_addr, uint32_t num_bytes) {
+	const char* src = host_addr;
+	uint32_t num_cells = num_bytes / sizeof(shibe_cell_t);
+	uint32_t num_tail_bytes = num_bytes % sizeof(shibe_cell_t);
+
+	uint32_t i = 0;
+	for (; i < num_cells && !shibe_panicked(vm); ++i) {
+		shibe_cell_t value = shibe_cell_patch_le(
+			SHIBE_ZERO, src + i * sizeof(shibe_cell_t), sizeof(shibe_cell_t)
+		);
+		shibe_store(vm, (shibe_cell_t){ vm_addr.u32 + i}, value);
+	}
+
+	// Read-modify-write the partial cell so only num_bytes bytes are touched
+	if (num_tail_bytes > 0 && !shibe_panicked(vm)) {
 		shibe_cell_t value = shibe_fetch(vm, (shibe_cell_t){ vm_addr.u32 + i});
-		if (shibe_panicked(vm)) { break; }
-		host_addr[i] = value;
+		if (shibe_panicked(vm)) { return; }
+		value = shibe_cell_patch_le(
+			value, src + i * sizeof(shibe_cell_t), num_tail_bytes
+		);
+		shibe_store(vm, (shibe_cell_t){ vm_addr.u32 + i}, value);
+	}
+}
+
+void
+shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       void* host_addr, uint32_t num_bytes) {
+	char* dst = host_addr;
+	uint32_t num_cells = num_bytes / sizeof(shibe_cell_t);
+	uint32_t num_tail_bytes = num_bytes % sizeof(shibe_cell_t);
+
+	uint32_t i = 0;
+	for (; i < num_cells && !shibe_panicked(vm); ++i) {
+		shibe_cell_t value = shibe_fetch(vm, (shibe_cell_t){ vm_addr.u32 + i});
+		if (shibe_panicked(vm)) { return; }
+		shibe_cell_extract_le(
+			dst + i * sizeof(shibe_cell_t), value, sizeof(shibe_cell_t)
+		);
+	}
+
+	if (num_tail_bytes > 0 && !shibe_panicked(vm)) {
+		shibe_cell_t value = shibe_fetch(vm, (shibe_cell_t){ vm_addr.u32 + i});
+		if (shibe_panicked(vm)) { return; }
+		shibe_cell_extract_le(
+			dst + i * sizeof(shibe_cell_t), value, num_tail_bytes
+		);
 	}
 }
 

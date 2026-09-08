@@ -1,5 +1,6 @@
 #include <btest.h>
 #include <shibe.h>
+#include <string.h>
 #include "common.h"
 
 static btest_suite_t basic = {
@@ -40,10 +41,10 @@ BTEST(basic, memory) {
 	shibe_cell_t to_vm[] = {
 		{ .i32 = -1 }, { .i32 = -2 }, { .i32 = -3 }, { .i32 = -4 }, { .i32 = -5 },
 	};
-	shibe_copy_to_vm(vm, cells, to_vm, BCOUNT_OF(to_vm));
+	shibe_copy_to_vm(vm, cells, to_vm, sizeof(to_vm));
 
 	shibe_cell_t from_vm[BCOUNT_OF(to_vm)] = { 0 };
-	shibe_copy_to_host(vm, cells, from_vm, BCOUNT_OF(from_vm));
+	shibe_copy_to_host(vm, cells, from_vm, sizeof(from_vm));
 	for (uint32_t i = 0; i < BCOUNT_OF(to_vm); ++i) {
 		BTEST_EXPECT_EQUAL("%d", from_vm[i].i32, to_vm[i].i32);
 	}
@@ -96,7 +97,7 @@ BTEST(basic, memory_out_of_bound) {
 	shibe_cell_t to_vm[] = {
 		{ .i32 = 11 }, { .i32 = 22 }, { .i32 = 33 }, { .i32 = 44 }, { .i32 = 55 },
 	};
-	shibe_copy_to_vm(vm, offset(cells, 2), to_vm, BCOUNT_OF(to_vm));
+	shibe_copy_to_vm(vm, offset(cells, 2), to_vm, sizeof(to_vm));
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_MEM_FAULT);
 	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, past_end.u32);
@@ -112,7 +113,7 @@ BTEST(basic, memory_out_of_bound) {
 	shibe_cell_t from_vm[BCOUNT_OF(to_vm)] = {
 		{ .i32 = -1 }, { .i32 = -1 }, { .i32 = -1 }, { .i32 = -1 }, { .i32 = -1 },
 	};
-	shibe_copy_to_host(vm, offset(cells, 2), from_vm, BCOUNT_OF(from_vm));
+	shibe_copy_to_host(vm, offset(cells, 2), from_vm, sizeof(from_vm));
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_MEM_FAULT);
 	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, past_end.u32);
@@ -187,4 +188,40 @@ BTEST(basic, stack_overflow) {
 	for (uint32_t i = 0; i < TEST_DS_LEN; ++i) {
 		BTEST_EXPECT_EQUAL("%u", state->ds[i].u32, i + 1);
 	}
+}
+
+BTEST(basic, memory_copy_bytes) {
+	shibe_cell_t cells = shibe_alloc(vm, SHIBE_MEM_REGION_0, (shibe_cell_t){ 3 });
+	BTEST_ASSERT(cells.u32 != 0);
+	for (uint32_t i = 0; i < 3; ++i) {
+		shibe_store(vm, offset(cells, i), (shibe_cell_t){ .u32 = 0xffffffff });
+	}
+
+	// Bytes are little-endian inside a cell, whatever the host is
+	const unsigned char raw[] = { 0x01, 0x02, 0x03, 0x04 };
+	shibe_copy_to_vm(vm, cells, raw, sizeof(raw));
+	BTEST_EXPECT_EQUAL("%u", shibe_fetch(vm, cells).u32, 0x04030201u);
+	unsigned char raw_back[sizeof(raw)] = { 0 };
+	shibe_copy_to_host(vm, cells, raw_back, sizeof(raw_back));
+	BTEST_EXPECT(memcmp(raw_back, raw, sizeof(raw)) == 0);
+	shibe_store(vm, cells, (shibe_cell_t){ .u32 = 0xffffffff });
+
+	// A byte count that is not a whole number of cells, from an unaligned source
+	const char text[] = "xhello";
+	const char* str = text + 1;
+	uint32_t len = 5;
+	shibe_copy_to_vm(vm, cells, str, len);
+	BTEST_ASSERT_EQUAL("%d", num_panics, 0);
+
+	// Only the copied bytes are touched, the rest of the partial cell survives
+	BTEST_EXPECT_EQUAL("%u", shibe_fetch(vm, offset(cells, 1)).u32, (0xffffff00u | (uint32_t)'o'));
+	BTEST_EXPECT_EQUAL("%u", shibe_fetch(vm, offset(cells, 2)).u32, 0xffffffffu);
+
+	// And it round-trips back into an unaligned host buffer
+	char buf[8] = { 0 };
+	shibe_copy_to_host(vm, cells, buf + 1, len);
+	BTEST_EXPECT(memcmp(buf + 1, str, len) == 0);
+	// The byte past the requested count is left alone
+	BTEST_EXPECT_EQUAL("%d", buf[1 + len], 0);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 }
