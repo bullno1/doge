@@ -26,7 +26,7 @@ typedef enum {
 	SHIBE_EXEC_IDLE,
 	SHIBE_EXEC_RUNNING,
 	SHIBE_EXEC_SUSPENDED,
-	SHIBE_EXEC_ERROR,
+	SHIBE_EXEC_PANIC,
 } shibe_exec_state_t;
 
 typedef enum {
@@ -42,7 +42,7 @@ typedef enum {
 
 typedef struct {
 	shibe_error_t error;
-	shibe_cell_t addr;
+	shibe_cell_t arg;
 } shibe_panic_t;
 
 typedef struct {
@@ -61,33 +61,35 @@ typedef struct {
 } shibe_state_t;
 
 typedef enum {
-	SHIBE_MEM_BANK_0,
-	SHIBE_MEM_BANK_1,
-	SHIBE_MEM_BANK_2,
-	SHIBE_MEM_BANK_3,
-	SHIBE_MEM_BANK_4,
-	SHIBE_MEM_BANK_5,
-	SHIBE_MEM_BANK_6,
-	SHIBE_MEM_BANK_7,
-} shibe_mem_bank_t;
+	SHIBE_MEM_REGION_0,
+	SHIBE_MEM_REGION_1,
+	SHIBE_MEM_REGION_2,
+	SHIBE_MEM_REGION_3,
+	SHIBE_MEM_REGION_4,
+	SHIBE_MEM_REGION_5,
+	SHIBE_MEM_REGION_6,
+	SHIBE_MEM_REGION_7,
+} shibe_mem_region_t;
+
+typedef struct shibe_allocator_s shibe_allocator_t;
+struct shibe_allocator_s {
+	void* (*alloc)(shibe_allocator_t* allocator, size_t size, size_t alignment);
+	void* (*snapshot)(shibe_allocator_t* allocator);
+	void (*restore)(shibe_allocator_t* allocator, void* snapshot);
+};
+
+typedef struct shibe_host_s shibe_host_t;
+struct shibe_host_s {
+	void (*panic)(shibe_host_t* host, shibe_vm_t* vm, const shibe_panic_t* panic);
+	shibe_status_t (*debug)(shibe_host_t* host, shibe_vm_t* vm, const shibe_state_t* state);
+	shibe_status_t (*extcall)(shibe_host_t* host, shibe_vm_t* vm, shibe_cell_t index);
+};
 
 typedef struct {
-	void* (*alloc)(void* ctx, size_t size, size_t alignment);
-	void* (*snapshot)(void* ctx);
-	void (*restore)(void* ctx, void* snapshot);
-} shibe_alloc_t;
+	size_t ds_len;
+	size_t as_len;
 
-typedef struct {
-	shibe_status_t (*debug)(void* ctx, shibe_vm_t* vm, const shibe_state_t* state);
-	shibe_status_t (*panic)(void* ctx, shibe_vm_t* vm, const shibe_panic_t* panic);
-	shibe_status_t (*extcall)(void* ctx, shibe_vm_t* vm, shibe_cell_t index);
-} shibe_host_t;
-
-typedef struct {
-	size_t data_stack_size;
-	size_t aux_stack_size;
-
-	shibe_alloc_t* alloc;
+	shibe_allocator_t* allocator;
 	shibe_host_t* host;
 } shibe_config_t;
 
@@ -104,19 +106,19 @@ SHIBE_API void
 shibe_reset(shibe_vm_t* vm);
 
 SHIBE_API shibe_cell_t
+shibe_alloc(shibe_vm_t* vm, shibe_mem_region_t region, shibe_cell_t num_cells);
+
+SHIBE_API shibe_cell_t
 shibe_fetch(shibe_vm_t* vm, shibe_cell_t vm_addr);
 
 SHIBE_API void
 shibe_store(shibe_vm_t* vm, shibe_cell_t vm_addr, shibe_cell_t value);
 
-SHIBE_API shibe_cell_t
-shibe_alloc(shibe_vm_t* vm, shibe_mem_bank_t bank, shibe_cell_t size);
+SHIBE_API void
+shibe_copy_to_vm  (shibe_vm_t* vm, shibe_cell_t vm_addr, const shibe_cell_t* host_addr, uint32_t num_cells);
 
 SHIBE_API void
-shibe_copy_to_vm  (shibe_vm_t* vm, shibe_cell_t vm_addr, const void* host_addr, size_t num_bytes);
-
-SHIBE_API void
-shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       void* host_addr, size_t num_bytes);
+shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       shibe_cell_t* host_addr, uint32_t num_cells);
 
 SHIBE_API const shibe_state_t*
 shibe_inspect(shibe_vm_t* vm);
@@ -132,5 +134,10 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr);
 
 SHIBE_API shibe_status_t
 shibe_resume(shibe_vm_t* vm);
+
+static inline shibe_mem_region_t
+shibe_mem_region(shibe_cell_t addr) {
+	return (shibe_mem_region_t)(addr.u32 >> 29);
+}
 
 #endif

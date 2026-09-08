@@ -28,6 +28,7 @@
 	X(SHIBE_OP_STORE) \
 	X(SHIBE_OP_BFETCH) \
 	X(SHIBE_OP_BSTORE) \
+	X(SHIBE_OP_COPY) \
 	/* Integer arithmetic */ \
 	X(SHIBE_OP_ADD) \
 	X(SHIBE_OP_SUB) \
