@@ -86,8 +86,8 @@ struct shibe_host_s {
 };
 
 typedef struct {
-	size_t ds_len;
-	size_t as_len;
+	uint32_t ds_len;
+	uint32_t as_len;
 
 	shibe_allocator_t* allocator;
 	shibe_host_t* host;
@@ -120,9 +120,6 @@ shibe_copy_to_vm  (shibe_vm_t* vm, shibe_cell_t vm_addr, const shibe_cell_t* hos
 SHIBE_API void
 shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       shibe_cell_t* host_addr, uint32_t num_cells);
 
-SHIBE_API const shibe_state_t*
-shibe_inspect(shibe_vm_t* vm);
-
 SHIBE_API void
 shibe_push(shibe_vm_t* vm, shibe_cell_t item);
 
@@ -134,6 +131,9 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr);
 
 SHIBE_API shibe_status_t
 shibe_resume(shibe_vm_t* vm);
+
+SHIBE_API const shibe_state_t*
+shibe_inspect(shibe_vm_t* vm);
 
 static inline shibe_mem_region_t
 shibe_mem_region(shibe_cell_t addr) {

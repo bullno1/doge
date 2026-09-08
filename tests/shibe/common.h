@@ -4,6 +4,8 @@
 #include <shibe/alloc.h>
 #include <bmacro.h>
 
+#define TEST_DS_LEN 256u
+
 static barena_pool_t arena_pool;
 static barena_t arena;
 static shibe_barena_t shibe_allocator;
@@ -50,6 +52,7 @@ init_per_test(void) {
 	last_panic = (shibe_panic_t){ 0 };
 	num_panics = 0;
 	vm = shibe_create((shibe_config_t){
+		.ds_len = TEST_DS_LEN,
 		.allocator = shibe_barena_init(&shibe_allocator, &arena_pool),
 		.host = &test_host,
 	});

@@ -132,3 +132,59 @@ BTEST(basic, memory_out_of_bound) {
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_IDLE);
 }
+
+BTEST(basic, stack) {
+	const shibe_state_t* state = shibe_inspect(vm);
+	BTEST_ASSERT_EQUAL("%u", state->dsp.u32, 0u);
+
+	// Push then pop in LIFO order
+	shibe_cell_t items[] = {
+		{ .i32 = 11 }, { .i32 = -22 }, { .f32 = 3.5f },
+	};
+	for (uint32_t i = 0; i < BCOUNT_OF(items); ++i) {
+		shibe_push(vm, items[i]);
+		BTEST_EXPECT_EQUAL("%u", state->dsp.u32, i + 1);
+	}
+
+	for (uint32_t i = BCOUNT_OF(items); i-- > 0;) {
+		shibe_cell_t item = shibe_pop(vm);
+		BTEST_EXPECT_EQUAL("%u", item.u32, items[i].u32);
+		BTEST_EXPECT_EQUAL("%u", state->dsp.u32, i);
+	}
+
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT(state->exec_state == SHIBE_EXEC_IDLE);
+
+	// Popping an empty stack faults
+	shibe_cell_t item = shibe_pop(vm);
+	BTEST_EXPECT_EQUAL("%u", item.u32, 0u);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_STACK_UNDERFLOW);
+	BTEST_EXPECT(state->exec_state == SHIBE_EXEC_PANIC);
+	BTEST_EXPECT_EQUAL("%u", state->dsp.u32, 0u);
+	clear_panic();
+
+	// The stack is usable again after the panic is cleared
+	shibe_push(vm, (shibe_cell_t){ .i32 = 7 });
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 7);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(basic, stack_overflow) {
+	const shibe_state_t* state = shibe_inspect(vm);
+	for (uint32_t i = 0; i < TEST_DS_LEN; ++i) {
+		shibe_push(vm, (shibe_cell_t){ .u32 = i + 1 });
+	}
+	BTEST_ASSERT_EQUAL("%d", num_panics, 0);
+	BTEST_ASSERT_EQUAL("%u", state->dsp.u32, TEST_DS_LEN);
+
+	// One past the end faults and leaves the stack untouched
+	shibe_push(vm, (shibe_cell_t){ .u32 = 0xdeadbeef });
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_STACK_OVERFLOW);
+	BTEST_EXPECT(state->exec_state == SHIBE_EXEC_PANIC);
+	BTEST_EXPECT_EQUAL("%u", state->dsp.u32, TEST_DS_LEN);
+	for (uint32_t i = 0; i < TEST_DS_LEN; ++i) {
+		BTEST_EXPECT_EQUAL("%u", state->ds[i].u32, i + 1);
+	}
+}

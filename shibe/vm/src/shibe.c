@@ -3,6 +3,7 @@
 #define SHIBE_REGION_BITS  3
 #define SHIBE_INDEX_BITS   29
 #define SHIBE_INDEX_MASK   ((1u << SHIBE_INDEX_BITS) - 1)
+#define SHIBE_ZERO ((shibe_cell_t){ 0 })
 
 #define BSEG_API static inline
 // The first 3 bits are used to address a region.
@@ -27,6 +28,9 @@ struct shibe_vm_s {
 
 static shibe_host_t shibe_dummy_host = { 0 };
 
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((cold, noinline))
+#endif
 static void
 shibe_panic(shibe_vm_t* vm, const shibe_panic_t* panic) {
 	shibe_host_t* host = vm->config.host;
@@ -136,7 +140,7 @@ shibe_reset(shibe_vm_t* vm) {
 	vm->state.dsp =
 	vm->state.asp =
 	vm->state.tp =
-	vm->state.tm = (shibe_cell_t){ 0 };
+	vm->state.tm = SHIBE_ZERO;
 
 	vm->state.exec_state = SHIBE_EXEC_IDLE;
 }
@@ -148,7 +152,7 @@ shibe_alloc(shibe_vm_t* vm, shibe_mem_region_t region, shibe_cell_t num_cells) {
 			.error = SHIBE_ERR_INVALID,
 			.arg = num_cells,
 		});
-		return (shibe_cell_t){ 0 };
+		return SHIBE_ZERO;
 	}
 
 	region = region & 0x07;
@@ -162,7 +166,7 @@ shibe_alloc(shibe_vm_t* vm, shibe_mem_region_t region, shibe_cell_t num_cells) {
 		shibe_panic(vm, &(shibe_panic_t){
 			.error = SHIBE_ERR_OOM,
 		});
-		return (shibe_cell_t){ 0 };
+		return SHIBE_ZERO;
 	}
 }
 
@@ -179,7 +183,7 @@ shibe_fetch(shibe_vm_t* vm, shibe_cell_t vm_addr) {
 			.error = SHIBE_ERR_MEM_FAULT,
 			.arg = vm_addr,
 		});
-		return (shibe_cell_t){ 0 };
+		return SHIBE_ZERO;
 	}
 }
 
@@ -212,6 +216,29 @@ shibe_copy_to_host(shibe_vm_t* vm, shibe_cell_t vm_addr,       shibe_cell_t* hos
 		shibe_cell_t value = shibe_fetch(vm, (shibe_cell_t){ vm_addr.u32 + i});
 		if (shibe_panicked(vm)) { break; }
 		host_addr[i] = value;
+	}
+}
+
+void
+shibe_push(shibe_vm_t* vm, shibe_cell_t item) {
+	if (vm->state.dsp.u32 < vm->config.ds_len) {
+		vm->state.ds[vm->state.dsp.u32++] = item;
+	} else {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_STACK_OVERFLOW,
+		});
+	}
+}
+
+shibe_cell_t
+shibe_pop(shibe_vm_t* vm) {
+	if (vm->state.dsp.u32 > 0) {
+		return vm->state.ds[--vm->state.dsp.u32];
+	} else {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_STACK_UNDERFLOW,
+		});
+		return SHIBE_ZERO;
 	}
 }
 
