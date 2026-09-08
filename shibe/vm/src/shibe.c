@@ -302,6 +302,22 @@ shibe_inspect(shibe_vm_t* vm) {
 	return &vm->state;
 }
 
-#define BSEG_REALLOC(ctx, ptr, size) shibe_realloc(ctx, ptr, size)
+shibe_status_t
+shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
+	if (shibe_panicked(vm)) {
+		return SHIBE_ERROR;
+	}
+
+	if (vm->state.exec_state != SHIBE_EXEC_IDLE) {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_INVALID,
+		});
+		return SHIBE_ERROR;
+	}
+
+	return SHIBE_ERROR;
+}
+
+#define BSEG_REALLOC(ptr, size, ctx) shibe_realloc(ptr, size, ctx)
 #define BSEG_IMPLEMENTATION
 #include <bseg.h>

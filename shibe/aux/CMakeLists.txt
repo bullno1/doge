@@ -1,5 +1,6 @@
 set(SOURCES
 	"src/alloc.c"
+	"src/asm.c"
 	"src/str.c"
 )
 add_library(shibe-aux STATIC "${SOURCES}")

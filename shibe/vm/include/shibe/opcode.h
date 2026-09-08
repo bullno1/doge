@@ -80,9 +80,11 @@
 
 #define SHIBE_ENUM(OPCODE) OPCODE,
 
-typedef enum {
+typedef enum : uint8_t {
 	SHIBE_OPCODE(SHIBE_ENUM)
 } shibe_opcode_t;
+
+_Static_assert(sizeof(shibe_opcode_t) == 1, "An opcode must fit in a byte to be bundled");
 
 #define SHIBE_OPCODE_TO_STR(OPCODE) case OPCODE: return &(#OPCODE[sizeof("SHIBE_OP_") - 1]);
 
@@ -95,6 +97,8 @@ shibe_opcode_to_str(shibe_opcode_t opcode) {
 }
 
 typedef shibe_opcode_t shibe_bundle_t[4];
+
+_Static_assert(sizeof(shibe_bundle_t) == sizeof(shibe_cell_t), "A bundle must be exactly one cell");
 
 static inline shibe_cell_t
 shibe_pack(const shibe_bundle_t bundle) {

@@ -1,6 +1,7 @@
 set(SOURCES
 	"main.c"
 
+	"shibe/asm.c"
 	"shibe/basic.c"
 	"shibe/str.c"
 )
