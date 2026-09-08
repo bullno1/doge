@@ -1,0 +1,12 @@
+#!/bin/sh -e
+
+cmd/linux/build || true
+
+inotifywait -r -e CLOSE_WRITE -m shibe tests deps | \
+    while read path action file
+	do
+		clear
+		echo "Rebuilding"
+		cmd/linux/build && cmd/linux/run || true
+		echo "Done"
+    done

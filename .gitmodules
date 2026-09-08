@@ -1,0 +1,3 @@
+[submodule "deps/blibs"]
+	path = deps/blibs
+	url = https://github.com/bullno1/libs.git

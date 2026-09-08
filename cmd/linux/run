@@ -1,0 +1,7 @@
+#!/bin/sh -e
+
+BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo}
+BUILD_DIR="${BUILD_TYPE}"
+
+#gdb -q -x tools/gdb.py -ex run --args bin/linux/${BUILD_DIR}/tests
+bin/linux/${BUILD_DIR}/tests

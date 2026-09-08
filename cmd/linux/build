@@ -1,0 +1,26 @@
+#!/bin/sh -e
+
+BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo}
+BUILD_DIR="${BUILD_TYPE}"
+
+mkdir -p .build/linux
+pushd .build/linux > /dev/null
+
+if [ ! -f "${BUILD_DIR}/build.ninja" ]
+then
+	cmake \
+		-G "Ninja" \
+		-B ${BUILD_DIR} \
+		-DCMAKE_TOOLCHAIN_FILE=../../../cmake/linux.cmake \
+		-DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+		-DPLATFORM_NAME="linux" \
+		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+		-DCMAKE_C_COMPILER_LAUNCHER=ccache \
+		-DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+		../../
+fi
+
+cmake --build ${BUILD_DIR}
+
+popd > /dev/null
