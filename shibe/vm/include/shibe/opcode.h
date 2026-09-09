@@ -53,10 +53,10 @@
 	X(ADD,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs+rhs:u32", "Integer addition") \
 	X(SUB,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs-rhs:u32", "Integer subtraction") \
 	X(MUL,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs*rhs:u32", "Integer multiplication") \
-	X(SDIV,     "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs/rhs:i32", "Signed integer division") \
-	X(SREM,     "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs%rhs:i32", "Signed integer remainder") \
-	X(UDIV,     "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs/rhs:u32", "Unsigned integer division") \
-	X(UREM,     "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs%rhs:u32", "Unsigned integer remainder") \
+	X(SDIV,     "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs/rhs:i32", "Signed integer division. A zero divisor yields 0, and `INT32_MIN / -1` wraps to `INT32_MIN`") \
+	X(SREM,     "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs%rhs:i32", "Signed integer remainder. A zero divisor yields `lhs`, keeping `lhs == (lhs / rhs) * rhs + lhs % rhs` true for every input. `INT32_MIN % -1` yields 0") \
+	X(UDIV,     "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs/rhs:u32", "Unsigned integer division. A zero divisor yields 0") \
+	X(UREM,     "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs%rhs:u32", "Unsigned integer remainder. A zero divisor yields `lhs`, keeping `lhs == (lhs / rhs) * rhs + lhs % rhs` true for every input") \
 	X(NEG,      "Integer arithmetic", 0, "num:i32 -- -num:i32", "Integer negation") \
 	X(EQ,       "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs==rhs:u32", "Integer equality test") \
 	X(NEQ,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs!=rhs:u32", "Integer inequality test") \
@@ -81,9 +81,9 @@
 	X(OR,       "Bitwise manipulation", 0, "lhs:u32 rhs:u32 -- lhs|rhs:u32", "Bitwise or") \
 	X(XOR,      "Bitwise manipulation", 0, "lhs:u32 rhs:u32 -- lhs^rhs:u32", "Bitwise xor") \
 	X(NOT,      "Bitwise manipulation", 0, "num:u32 -- ~num:u32", "Bitwise not") \
-	X(SHL,      "Bitwise manipulation", 0, "num:u32 amount:u32 -- num<<amount:u32", "Bit-shift left") \
-	X(SHR,      "Bitwise manipulation", 0, "num:u32 amount:u32 -- num>>amount:u32", "Logical shift right (no sign extend)") \
-	X(SAR,      "Bitwise manipulation", 0, "num:i32 amount:u32 -- num>>amount:i32", "Arithmetic shift right (sign extend)") \
+	X(SHL,      "Bitwise manipulation", 0, "num:u32 amount:u32 -- num<<amount:u32", "Bit-shift left. `amount` is masked to [0, 31] (`amount & 31`)") \
+	X(SHR,      "Bitwise manipulation", 0, "num:u32 amount:u32 -- num>>amount:u32", "Logical shift right (no sign extend). `amount` is masked to [0, 31] (`amount & 31`)") \
+	X(SAR,      "Bitwise manipulation", 0, "num:i32 amount:u32 -- num>>amount:i32", "Arithmetic shift right (sign extend). `amount` is masked to [0, 31] (`amount & 31`)") \
 	\
 	X(TMOVE,    "Temporary register", 0, "amount:i32 --", "Move the temporary register by the amount (vm.tp += amount)") \
 	X(TSET,     "Temporary register", 0, "temp:u32 --", "Set the temporary register (vm.tp = temp)") \
@@ -95,6 +95,7 @@
 	X(UNWIND,   "Aux frame", 0                    , "..x -- ; ..frame:aux-frame --", "Deallocate the auxiliary frame, restoring states, including the data stack") \
 	X(AGET,     "Aux frame", SHIBE_OPCODE_FLAG_IMM, "-- value:cell", "Retrieve a value from an auxiliary slot. The operand is a signed index: 0 and up reach the general purpose slots, negative values reach the frame header") \
 	X(ASET,     "Aux frame", SHIBE_OPCODE_FLAG_IMM, "value:cell --", "Store a value into an auxiliary slot. The operand must be a non-negative index, the frame header is read only") \
+	\
 	X(EXTCALL,  "External call", SHIBE_OPCODE_FLAG_IMM | SHIBE_OPCODE_FLAG_ENDS_BUNDLE, "..a -- ..b", "Make a call to the host with the call number in the operand. The stack effect is unknown. The signature is usually predeclared and the host must take great care to not break the contract.") \
 
 /*

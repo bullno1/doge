@@ -293,6 +293,7 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	}
 
 	vm->state.ip = addr;
+	vm->state.exec_state = SHIBE_EXEC_RUNNING;
 
 	// Creating 2 separate versions is the only way to have optimized opcode
 	// dispatch when no debug hook is attached
@@ -303,15 +304,19 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	}
 }
 
+// The interpreter is compiled into this file, so exec.h must not stand in for
+// anything it already has
+#define SHIBE_EXEC_INLINED
+
 #define SHIBE_VM_EXECUTE shibe_execute_without_hook
-#define SHIBE_DEBUG_HOOK(host, vm, state, offset)
+#define SHIBE_HAS_HOOK 0
 #include "exec.h"
 
-#undef SHIBE_DEBUG_HOOK
+#undef SHIBE_HAS_HOOK
 #undef SHIBE_VM_EXECUTE
 
 #define SHIBE_VM_EXECUTE shibe_execute_with_hook
-#define SHIBE_DEBUG_HOOK(host, vm, state, offset) host->debug(host, vm, state, offset)
+#define SHIBE_HAS_HOOK 1
 #include "exec.h"
 
 #define BSEG_REALLOC(ptr, size, ctx) shibe_realloc(ptr, size, ctx)

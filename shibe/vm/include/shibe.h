@@ -32,11 +32,16 @@ typedef enum {
 typedef enum {
 	SHIBE_ERR_NONE,
 	SHIBE_ERR_INVALID,
+	// `arg` names the stack: 0 for the data stack, 1 for the auxiliary stack
 	SHIBE_ERR_STACK_OVERFLOW,
 	SHIBE_ERR_STACK_UNDERFLOW,
 	SHIBE_ERR_OOM,
+	// `arg` is the address that faulted
 	SHIBE_ERR_MEM_FAULT,
 	SHIBE_ERR_TRAP,
+	// A host callback failed on its own. `arg` is the external call number, or
+	// 0 when it was the debug hook. A callback that instead relays a panic
+	// raised on this vm from underneath it keeps that panic's reason.
 	SHIBE_ERR_HOST,
 } shibe_error_t;
 
@@ -82,10 +87,18 @@ struct shibe_allocator_s {
 	void (*restore)(shibe_allocator_t* allocator, void* snapshot);
 };
 
+// Where the interpreter is: the address of the bundle being executed and which
+// of its four slots is running. Addresses are cell addresses throughout, so an
+// opcode is named by a base and an offset rather than by an address of its own.
+typedef struct {
+	shibe_cell_t bundle;
+	uint8_t slot;
+} shibe_op_addr_t;
+
 typedef struct shibe_host_s shibe_host_t;
 struct shibe_host_s {
 	void (*panic)(shibe_host_t* host, shibe_vm_t* vm, const shibe_panic_t* panic);
-	shibe_status_t (*debug)(shibe_host_t* host, shibe_vm_t* vm, const shibe_state_t* state, uint32_t bundle_offset);
+	shibe_status_t (*debug)(shibe_host_t* host, shibe_vm_t* vm, const shibe_state_t* state, shibe_op_addr_t at);
 	shibe_status_t (*extcall)(shibe_host_t* host, shibe_vm_t* vm, shibe_cell_t index);
 };
 

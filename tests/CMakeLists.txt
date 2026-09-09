@@ -3,6 +3,7 @@ set(SOURCES
 
 	"shibe/asm.c"
 	"shibe/basic.c"
+	"shibe/exec.c"
 	"shibe/str.c"
 )
 
