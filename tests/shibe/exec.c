@@ -68,6 +68,37 @@ suspending_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
 static shibe_cell_t last_stop;
 static int num_stops;
 
+// Counts every point the host could stop at, and says whether to stop at this
+// one. A target of 0 stops nowhere, which is the reference run; -1 stops
+// everywhere it can.
+static int sweep_step;
+static int sweep_target;
+
+// What the sweep actually reached. A property test that never enters the shapes
+// it is meant to cover passes for the wrong reason, so these are asserted.
+static int sweep_leaf_stops;
+static int sweep_late_stops;
+static int sweep_defers;
+static int sweep_reentries;
+
+// Host calls entered, and host calls that reached their end. Comparing vm state
+// alone cannot see a call that was dropped half way, or done twice, when its
+// effect on the stacks happens to cancel out. Every run has to finish what it
+// starts, whether or not it stopped along the way.
+static int sweep_started;
+static int sweep_finished;
+
+// Hook stops taken inside the run a continuation started. That is the only way
+// to get a stop with no frame relayed through a continuation, which is the one
+// shape that tells a relayed suspension apart from a continuation's own.
+static int sweep_deep_stops;
+
+static bool
+sweep_should_stop(void) {
+	++sweep_step;
+	return sweep_target < 0 || sweep_step == sweep_target;
+}
+
 static shibe_status_t
 stepping_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
 	(void)host; (void)hooked; (void)state;
@@ -105,6 +136,10 @@ failing_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state,
 // The stub a compiler would emit for an exported word, re-entered by the
 // callback below
 static shibe_cell_t nested_entry;
+
+// A second stub, for a re-entry made from inside a continuation. It leaves the
+// data stack as it found it.
+static shibe_cell_t deferred_entry;
 
 static shibe_status_t
 reentrant_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
@@ -483,6 +518,8 @@ exec_init_per_test(void) {
 	num_deep_calls = 0;
 	last_stop = (shibe_cell_t){ 0 };
 	num_stops = 0;
+	sweep_step = 0;
+	sweep_target = 0;
 	observed_hook_ip = (shibe_cell_t){ .u32 = 0xffffffffu };
 	observed_first_ip = (shibe_cell_t){ .u32 = 0xffffffffu };
 
@@ -497,6 +534,205 @@ exec_cleanup_per_test(void) {
 	test_host.debug = NULL;
 	test_host.extcall = NULL;
 	cleanup_per_test();
+}
+
+/* Suspension has to be invisible: a run that stops and is resumed must end up
+ * exactly where the same run would have ended without stopping. That makes a
+ * plain run the oracle for every stopped one, so suspension points can be swept
+ * without writing an expectation for each. */
+
+#define SWEEP_PRODUCE   1u  // pushes 10, possibly late
+#define SWEEP_REENTER   2u  // runs `nested_entry`, possibly stopping after it
+#define SWEEP_PRODUCED 11u  // the second half of SWEEP_PRODUCE
+#define SWEEP_REENTERED 12u // the second half of SWEEP_REENTER
+#define SWEEP_QUIET      3u // as SWEEP_PRODUCE, for the run a continuation starts
+#define SWEEP_QUIETED   13u // the second half of SWEEP_QUIET
+// Brackets around a run, so that dropping it anywhere inside shows up as a call
+// that started and never finished
+#define SWEEP_MARK_IN    4u
+#define SWEEP_MARK_OUT   5u
+
+static shibe_status_t
+sweep_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host;
+	++num_extcalls;
+
+	switch (index.u32) {
+		case SWEEP_MARK_IN:
+			++sweep_started;
+			return SHIBE_OK;
+
+		case SWEEP_MARK_OUT:
+			++sweep_finished;
+			return SHIBE_OK;
+
+		case SWEEP_QUIET:
+		case SWEEP_PRODUCE:
+			++sweep_started;
+			if (sweep_should_stop()) {
+				++sweep_leaf_stops;
+				shibe_frame_t frame = shibe_alloc_frame(called, 2);
+				shibe_set_local(called, frame, 0, (shibe_cell_t){ .i32 = 10 });
+				shibe_set_continuation(called, frame, (shibe_cell_t){
+					.u32 = index.u32 == SWEEP_PRODUCE ? SWEEP_PRODUCED : SWEEP_QUIETED,
+				});
+				return SHIBE_SUSPENDED;
+			}
+			++sweep_finished;
+			shibe_push(called, (shibe_cell_t){ .i32 = 10 });
+			return SHIBE_OK;
+
+		case SWEEP_QUIETED:
+		case SWEEP_PRODUCED: {
+			shibe_frame_t frame = shibe_get_frame(called);
+			// Local 1 makes this a one shot, so stopping everywhere still ends
+			if (shibe_get_local(called, frame, 1).u32 == 0 && sweep_should_stop()) {
+				++sweep_defers;
+				shibe_set_local(called, frame, 1, (shibe_cell_t){ .u32 = 1 });
+				// Being called consumed it, so ask to be called again
+				shibe_set_continuation(called, frame, index);
+				return SHIBE_SUSPENDED;
+			}
+			// What the first half would have left behind
+			++sweep_finished;
+			shibe_push(called, shibe_get_local(called, frame, 0));
+			return SHIBE_OK;
+		}
+
+		case SWEEP_REENTER: {
+			++sweep_started;
+			shibe_frame_t frame = shibe_alloc_frame(called, 1);
+			shibe_set_continuation(
+				called, frame, (shibe_cell_t){ .u32 = SWEEP_REENTERED }
+			);
+			shibe_status_t status = shibe_execute(called, nested_entry);
+			if (status != SHIBE_OK) { return status; }
+			// Stopping here is the other shape: the run this call started has
+			// already finished, so there is nothing to pick up but the call
+			if (!sweep_should_stop()) { ++sweep_finished; return SHIBE_OK; }
+			++sweep_late_stops;
+			return SHIBE_SUSPENDED;
+		}
+
+		default: {
+			// The nested run did the work, so there is nothing left to leave.
+			// Starting another one from in here is the shape that matters: a
+			// second half that runs something which then stops is relaying, not
+			// stopping itself, and the run it started is what a resume owes.
+			shibe_frame_t frame = shibe_get_frame(called);
+			if (shibe_get_local(called, frame, 0).u32 == 0 && sweep_should_stop()) {
+				++sweep_reentries;
+				// Counted here rather than inside the run, because a hook can
+				// stop at the head of its very first bundle - before anything
+				// in it has run. A marker inside could never see that stop being
+				// dropped; one taken before the run starts always can.
+				++sweep_started;
+				shibe_set_local(called, frame, 0, (shibe_cell_t){ .u32 = 1 });
+				shibe_set_continuation(called, frame, index);
+				// Leaves the data stack as it found it, so the run underneath
+				// cannot tell it happened
+				return shibe_execute(called, deferred_entry);
+			}
+			++sweep_finished;
+			return SHIBE_OK;
+		}
+	}
+}
+
+// Stops at the start of a bundle, remembering where so that being reported
+// again after the resume does not stop it a second time
+static shibe_status_t
+sweep_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
+	(void)host; (void)hooked; (void)state;
+	++num_steps;
+
+	if (at.slot != 0 || at.bundle.u32 == last_stop.u32) { return SHIBE_OK; }
+	if (!sweep_should_stop()) { return SHIBE_OK; }
+
+	if (deferred_entry.u32 != 0 && at.bundle.u32 >= deferred_entry.u32) {
+		++sweep_deep_stops;
+	}
+	last_stop = at.bundle;
+	return SHIBE_SUSPENDED;
+}
+
+typedef struct {
+	shibe_status_t status;
+	uint32_t depth;
+	uint32_t asp;
+	int panics;
+	int started;
+	int finished;
+	shibe_cell_t ds[8];
+} sweep_outcome_t;
+
+// Runs `entry` to a stop that is not a suspension, however many resumes that
+// takes, and reports where it ended up
+static sweep_outcome_t
+sweep_run(shibe_cell_t entry, int target) {
+	shibe_reset(vm);
+	num_panics = 0;
+	last_panic = (shibe_panic_t){ 0 };
+	last_stop = (shibe_cell_t){ 0 };
+	sweep_step = 0;
+	sweep_target = target;
+	sweep_started = sweep_finished = 0;
+	last_stop = (shibe_cell_t){ 0 };
+
+	shibe_status_t status = shibe_execute(vm, entry);
+	// The bound is what turns a resume that never gets anywhere into a failure
+	for (int i = 0; status == SHIBE_SUSPENDED && i < 64; ++i) {
+		status = shibe_resume(vm);
+	}
+
+	sweep_outcome_t outcome = {
+		.status = status,
+		.depth = shibe_inspect(vm)->dsp.u32,
+		.asp = shibe_inspect(vm)->asp.u32,
+		.panics = num_panics,
+		.started = sweep_started,
+		.finished = sweep_finished,
+	};
+	for (uint32_t i = 0; i < outcome.depth && i < 8; ++i) {
+		outcome.ds[i] = shibe_inspect(vm)->ds[i];
+	}
+	return outcome;
+}
+
+static void
+sweep(shibe_cell_t entry, const char* what) {
+	sweep_leaf_stops = sweep_late_stops = sweep_defers = sweep_reentries = 0;
+	sweep_deep_stops = 0;
+
+	sweep_outcome_t want = sweep_run(entry, 0);
+	BTEST_ASSERT_EQUAL("%d", want.status, SHIBE_OK);
+	BTEST_ASSERT_EQUAL("%d", want.panics, 0);
+	int num_points = sweep_step;
+	BTEST_EXPECT(num_points > 0);
+
+	// Every point on its own, then all of them at once
+	for (int target = 1; target <= num_points + 1; ++target) {
+		sweep_outcome_t got = sweep_run(entry, target <= num_points ? target : -1);
+
+		BTEST_EXPECT_EQUAL("%s", what, what);
+		BTEST_EXPECT_EQUAL("%d", got.status, want.status);
+		BTEST_EXPECT_EQUAL("%d", got.panics, want.panics);
+		BTEST_EXPECT_EQUAL("%u", got.depth, want.depth);
+		BTEST_EXPECT_EQUAL("%u", got.asp, want.asp);
+		// A call dropped half way, or done twice, shows up here even when its
+		// effect on the stacks cancelled out
+		BTEST_EXPECT_EQUAL("%d", got.finished, got.started);
+		for (uint32_t i = 0; i < want.depth && i < 8; ++i) {
+			BTEST_EXPECT_EQUAL("%d", got.ds[i].i32, want.ds[i].i32);
+		}
+	}
+
+	// Every shape a stop can take has to have been reached, or the sweep is
+	// only reporting that it did not look
+	BTEST_EXPECT(sweep_leaf_stops > 0);
+	BTEST_EXPECT(sweep_late_stops > 0);
+	BTEST_EXPECT(sweep_defers > 0);
+	BTEST_EXPECT(sweep_reentries > 0);
 }
 
 static btest_suite_t sexec = {
@@ -540,6 +776,66 @@ framed_reentering_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state
 	shibe_frame_t frame = shibe_alloc_frame(hooked, 0);
 	shibe_set_continuation(hooked, frame, (shibe_cell_t){ .u32 = 6 });
 	return shibe_execute(hooked, nested_entry);
+}
+
+// Assembles a program that calls out, re-enters, and calls out again from
+// inside the nested run, so one sweep covers leaf stops, stops taken after a
+// nested run finished, and stops raised underneath one
+static void
+sweep_program(void) {
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_PRODUCE }));
+	LIT(5);
+	EMIT(ADD);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_REENTER }));
+	EMIT(ADD);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_MARK_IN }));
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_PRODUCE }));
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_PRODUCE }));
+	EMIT(ADD);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_MARK_OUT }));
+	EMIT(RET);
+
+	shibe_asm_align(sasm);
+	deferred_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub2 = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub2);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	// Only the far end is marked: the near end was counted before the run began
+	shibe_asm_bind_label(sasm, sub2);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_QUIET }));
+	EMIT(DRP);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = SWEEP_MARK_OUT }));
+	EMIT(RET);
+
+	BTEST_ASSERT(shibe_asm_end(sasm));
+}
+
+BTEST(sexec, stopping_anywhere_leaves_the_same_result) {
+	test_host.extcall = sweep_extcall;
+	sweep_program();
+	sweep(code, "extcall stops");
+}
+
+BTEST(sexec, stopping_anywhere_with_a_hook_leaves_the_same_result) {
+	// The hook adds a stop at the head of every bundle, and puts the whole
+	// thing through the other interpreter build
+	test_host.extcall = sweep_extcall;
+	test_host.debug = sweep_hook;
+	sweep_program();
+	sweep(code, "extcall and hook stops");
+	BTEST_EXPECT(sweep_deep_stops > 0);
 }
 
 BTEST(sexec, arithmetic) {

@@ -562,11 +562,7 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 			status = SHIBE_ERROR;
 		} else {
 			// The frame outlives this run: it belongs to the callback, which is
-			// still going, and the callback site takes it back on the way out.
-			// Only `ip` goes back now, so that a callback which suspends after
-			// this records where the run underneath carries on rather than
-			// where the run that just finished stopped.
-			vm->state.ip = vm->state.as[frame + SHIBE_AUX_HOST_OUTER_IP];
+			// still ongoing, and the callback site takes it back on the way out.
 			vm->state.exec_state = SHIBE_EXEC_RUNNING;
 		}
 	}
