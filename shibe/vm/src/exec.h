@@ -184,7 +184,10 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 					/* A frame nobody can finish would strand both itself and \
 					 * whatever ran under it */ \
 					if (vm->state.as[host_fp_ + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) { \
-						SHIBE_FAULT(SHIBE_ERR_INVALID, SHIBE_ZERO); \
+						SHIBE_FAULT( \
+							SHIBE_ERR_NOT_SUSPENDABLE, \
+							((shibe_cell_t){ .u32 = host_fp_ }) \
+						); \
 					} \
 					vm->suspension.at_continuation = true; \
 				} else { \

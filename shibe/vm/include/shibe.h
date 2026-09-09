@@ -42,6 +42,9 @@ typedef enum {
 typedef enum {
 	SHIBE_ERR_NONE,
 	SHIBE_ERR_INVALID,
+	// Suspension requested when there is no continuation
+	// `arg` points at the offending frame
+	SHIBE_ERR_NOT_SUSPENDABLE,
 	// `arg` names the stack: 0 for the data stack, 1 for the auxiliary stack
 	SHIBE_ERR_STACK_OVERFLOW,
 	SHIBE_ERR_STACK_UNDERFLOW,
@@ -192,7 +195,7 @@ shibe_pop(shibe_vm_t* vm);
  *
  * To make this call suspendable, the caller has to call @ref shibe_set_continuation.
  * Otherwise, a call lower in the chain returning @ref SHIBE_SUSPENDED would panic
- * with @ref SHIBE_ERR_INVALID instead.
+ * with @ref SHIBE_ERR_NOT_SUSPENDABLE instead.
  */
 SHIBE_API shibe_status_t
 shibe_execute(shibe_vm_t* vm, shibe_cell_t addr);
@@ -260,7 +263,7 @@ shibe_get_frame(shibe_vm_t* vm);
  *
  * Slot 0 is reserved to mean "unbound", so leaving it unset, or setting it back
  * to 0, marks the next run as non-suspendable, and any attempt to suspend it
- * panics with `SHIBE_ERR_INVALID`.
+ * panics with `SHIBE_ERR_NOT_SUSPENDABLE`.
  *
  * If a continuation makes another suspendable call to the VM again, it has
  * to call this function again to set an appropriate continuation which is

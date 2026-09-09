@@ -1123,7 +1123,9 @@ BTEST(sexec, a_continuation_that_names_no_successor_is_rejected) {
 	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_ERROR);
 	BTEST_EXPECT_EQUAL("%d", num_continuations, 1);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
-	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_NOT_SUSPENDABLE);
+	// `arg` names the frame that named nothing, so a walker can say which call
+	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, shibe_inspect(vm)->fp.u32);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
 }
 
@@ -1245,7 +1247,7 @@ BTEST(sexec, suspending_on_a_frame_with_no_continuation_is_rejected) {
 	// though the run underneath is a top level one that could have carried on
 	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
-	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_NOT_SUSPENDABLE);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
 }
 
@@ -1382,7 +1384,7 @@ BTEST(sexec, nested_extcall_suspension_is_rejected) {
 	// Raised once, at the boundary the suspension could not cross, and only
 	// relayed by the level above it
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
-	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_NOT_SUSPENDABLE);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
 	// Ends the nest like any other panic, host frame left to walk
 	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 8u);
@@ -1416,7 +1418,7 @@ BTEST(sexec, nested_hook_suspension_is_rejected) {
 
 	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
-	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_NOT_SUSPENDABLE);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
 }
 

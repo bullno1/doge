@@ -529,7 +529,8 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 		if (frame != 0
 		 && vm->state.as[frame + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) {
 			shibe_panic(vm, &(shibe_panic_t){
-				.error = SHIBE_ERR_INVALID,
+				.error = SHIBE_ERR_NOT_SUSPENDABLE,
+				.arg = { .u32 = frame },
 			});
 			status = SHIBE_ERROR;
 		}
@@ -638,7 +639,8 @@ shibe_resume(shibe_vm_t* vm) {
 			// and one that named nothing could not have suspended in the first
 			// place, so this is a frame nothing can take back
 			shibe_panic(vm, &(shibe_panic_t){
-				.error = SHIBE_ERR_INVALID,
+				.error = SHIBE_ERR_NOT_SUSPENDABLE,
+				.arg = { .u32 = fp },
 			});
 			return SHIBE_ERROR;
 		}
@@ -653,7 +655,8 @@ shibe_resume(shibe_vm_t* vm) {
 				// a frame with continuation
 				if (vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) {
 					shibe_panic(vm, &(shibe_panic_t){
-						.error = SHIBE_ERR_INVALID,
+						.error = SHIBE_ERR_NOT_SUSPENDABLE,
+						.arg = { .u32 = fp },
 					});
 					return SHIBE_ERROR;
 				}
