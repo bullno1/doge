@@ -39,10 +39,17 @@ typedef enum {
 	// `arg` is the address that faulted
 	SHIBE_ERR_MEM_FAULT,
 	SHIBE_ERR_TRAP,
-	// A host callback failed on its own. `arg` is the external call number, or
-	// 0 when it was the debug hook. A callback that instead relays a panic
-	// raised on this vm from underneath it keeps that panic's reason.
-	SHIBE_ERR_HOST,
+	// The external call handler failed on its own. `arg` is the call number.
+	SHIBE_ERR_EXTCALL,
+	// The debug hook failed on its own. `arg` is unused.
+	SHIBE_ERR_HOOK,
+	// An EXTCALL reached no handler: either none is installed, or it was call
+	// number 0, which is reserved so that an unpached operand cell cannot
+	// dispatch anywhere. `arg` is the call number.
+	SHIBE_ERR_UNBOUND,
+
+	// None of the three is raised by a callback that merely relays a panic
+	// raised on this vm from underneath it. That keeps its own reason.
 } shibe_error_t;
 
 typedef struct {

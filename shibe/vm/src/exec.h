@@ -135,21 +135,21 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 // What to make of the status a host callback returned.
 //
 // The callback may have failed on its own, or it may be relaying a panic that
-// was already raised on this vm from underneath it - by a nested shibe_execute,
+// was already raised on this vm from underneath it: by a nested shibe_execute,
 // or by any public api call that faulted. Only the first of those is a new
 // panic. Re-raising the second would fire the host's panic handler a second
-// time and overwrite the original reason with SHIBE_ERR_HOST, losing it.
+// time and overwrite the original reason with the host's, losing it.
 //
 // A vm that is already panicked wins over whatever the callback returned: a
 // callback that panics the vm and then reports SHIBE_OK is still a stop.
-#define SHIBE_HOST_RESULT(STATUS, ARG) \
+#define SHIBE_HOST_RESULT(STATUS, ERROR, ARG) \
 	do { \
 		shibe_status_t host_status_ = (STATUS); \
 		if (shibe_panicked(vm)) { \
 			SHIBE_SAVE_STATE(vm, state); \
 			return SHIBE_ERROR; \
 		} \
-		if (host_status_ == SHIBE_ERROR) { SHIBE_FAULT(SHIBE_ERR_HOST, (ARG)); } \
+		if (host_status_ == SHIBE_ERROR) { SHIBE_FAULT((ERROR), (ARG)); } \
 		if (host_status_ == SHIBE_SUSPENDED) { \
 			SHIBE_SAVE_STATE(vm, state); \
 			vm->state.exec_state = SHIBE_EXEC_SUSPENDED; \
@@ -382,7 +382,7 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 				SHIBE_SAVE_STATE(vm, state); \
 				shibe_status_t hook_ = host->debug(host, vm, &vm->state, at); \
 				SHIBE_LOAD_STATE(vm, state); \
-				SHIBE_HOST_RESULT(hook_, SHIBE_ZERO); \
+				SHIBE_HOST_RESULT(hook_, SHIBE_ERR_HOOK, SHIBE_ZERO); \
 			} \
 		} while (0)
 #else
@@ -708,14 +708,19 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 	SHIBE_OP(EXTCALL) {
 		shibe_cell_t index;
 		SHIBE_IMM(index);
-		if (host->extcall == NULL) { SHIBE_FAULT(SHIBE_ERR_HOST, index); }
+		// Call 0 is unbound regardless of whether there is a handler, so an
+		// unpatched operand cell always faults instead of dispatching into
+		// slot 0
+		if (index.u32 == 0 || host->extcall == NULL) {
+			SHIBE_FAULT(SHIBE_ERR_UNBOUND, index);
+		}
 
 		// The host reaches back in through the public api, which works on
 		// vm->state, so the registers have to be visible to it
 		SHIBE_SAVE_STATE(vm, state);
 		shibe_status_t status = host->extcall(host, vm, index);
 		SHIBE_LOAD_STATE(vm, state);
-		SHIBE_HOST_RESULT(status, index);
+		SHIBE_HOST_RESULT(status, SHIBE_ERR_EXTCALL, index);
 
 		SHIBE_NEXT_BUNDLE();
 	}

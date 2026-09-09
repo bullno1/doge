@@ -96,7 +96,7 @@
 	X(AGET,     "Aux frame", SHIBE_OPCODE_FLAG_IMM, "-- value:cell", "Retrieve a value from an auxiliary slot. The operand is a signed index: 0 and up reach the general purpose slots, negative values reach the frame header") \
 	X(ASET,     "Aux frame", SHIBE_OPCODE_FLAG_IMM, "value:cell --", "Store a value into an auxiliary slot. The operand must be a non-negative index, the frame header is read only") \
 	\
-	X(EXTCALL,  "External call", SHIBE_OPCODE_FLAG_IMM | SHIBE_OPCODE_FLAG_ENDS_BUNDLE, "..a -- ..b", "Make a call to the host with the call number in the operand. The stack effect is unknown. The signature is usually predeclared and the host must take great care to not break the contract.") \
+	X(EXTCALL,  "External call", SHIBE_OPCODE_FLAG_IMM | SHIBE_OPCODE_FLAG_ENDS_BUNDLE, "..a -- ..b", "Make a call to the host with the call number in the operand. Numbering starts at 1: call 0 is reserved and always faults as unbound, so an operand cell that was never patched cannot dispatch anywhere. The stack effect is unknown. The signature is usually predeclared and the host must take great care to not break the contract.") \
 
 /*
  * # Auxiliary frame and temporary pointer

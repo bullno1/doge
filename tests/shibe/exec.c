@@ -530,7 +530,7 @@ BTEST(sexec, extcall_failure_panics) {
 	BTEST_EXPECT_EQUAL("%d", num_extcalls, 1);
 	// The host failed on its own, so this is a fresh panic naming the call
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
-	BTEST_EXPECT(last_panic.error == SHIBE_ERR_HOST);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_EXTCALL);
 	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, 3u);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
 }
@@ -543,7 +543,7 @@ BTEST(sexec, extcall_relaying_a_panic_keeps_the_original_reason) {
 
 	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
 	BTEST_EXPECT_EQUAL("%d", num_extcalls, 1);
-	// Fired once, by the pop that failed, and not re-raised as SHIBE_ERR_HOST
+	// Fired once, by the pop that failed, and not re-raised as an extcall error
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_STACK_UNDERFLOW);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
@@ -572,7 +572,7 @@ BTEST(sexec, debug_hook_failure_panics) {
 	// It failed on the very first opcode
 	BTEST_EXPECT_EQUAL("%d", num_steps, 1);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
-	BTEST_EXPECT(last_panic.error == SHIBE_ERR_HOST);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_HOOK);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
 }
 
@@ -695,4 +695,31 @@ BTEST(sexec, re_entry_exhausting_the_aux_stack_panics_once) {
 	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, 1u);
 	// Relayed back up through every level without being raised again
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+}
+
+BTEST(sexec, extcall_zero_is_unbound) {
+	// Installed and working, but call 0 never reaches it
+	test_host.extcall = record_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 0 }));
+	EMIT(HALT);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 0);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_UNBOUND);
+	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, 0u);
+}
+
+BTEST(sexec, extcall_without_a_handler_is_unbound) {
+	// test_host.extcall is left NULL by the fixture
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 3 }));
+	EMIT(HALT);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_UNBOUND);
+	// Same reason, and it still names the call the program asked for
+	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, 3u);
 }
