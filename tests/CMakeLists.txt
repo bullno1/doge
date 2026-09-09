@@ -5,6 +5,7 @@ set(SOURCES
 	"shibe/basic.c"
 	"shibe/exec.c"
 	"shibe/str.c"
+	"shibe/suspend.c"
 )
 
 add_executable(doge-tests "${SOURCES}")
