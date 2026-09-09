@@ -1,6 +1,16 @@
 #include <shibe/asm.h>
 #include <string.h>
 
+// MSVC does not declare max_align_t in C mode. Its widest fundamental type is
+// 8 bytes, so double is the same alignment; barena makes the same substitution.
+#ifndef SHIBE_ASM_MAX_ALIGN_TYPE
+#	ifdef _MSC_VER
+#		define SHIBE_ASM_MAX_ALIGN_TYPE double
+#	else
+#		define SHIBE_ASM_MAX_ALIGN_TYPE max_align_t
+#	endif
+#endif
+
 #define SHIBE_ASM_BUNDLE_LEN sizeof(shibe_bundle_t)
 
 #define BSEG_API static inline
@@ -63,7 +73,7 @@ shibe_asm_realloc(void* ptr, size_t size, shibe_asm_t* sasm) {
 
 	shibe_allocator_t* allocator = sasm->allocator;
 	// The callback carries no element type, so align for the worst case
-	void* mem = allocator->alloc(allocator, size, _Alignof(max_align_t));
+	void* mem = allocator->alloc(allocator, size, _Alignof(SHIBE_ASM_MAX_ALIGN_TYPE));
 	if (mem == NULL) { sasm->failed = true; }
 
 	return mem;

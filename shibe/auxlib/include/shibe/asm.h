@@ -1,6 +1,7 @@
 #ifndef SHIBE_ASM_H
 #define SHIBE_ASM_H
 
+#include <stdbool.h>
 #include <shibe.h>
 #include <shibe/opcode.h>
 

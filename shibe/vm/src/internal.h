@@ -1,6 +1,7 @@
 #ifndef SHIBE_INTERNAL_H
 #define SHIBE_INTERNAL_H
 
+#include <stdbool.h>
 #include <shibe.h>
 
 #define SHIBE_ZERO ((shibe_cell_t){ 0 })
