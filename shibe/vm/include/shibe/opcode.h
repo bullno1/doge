@@ -218,9 +218,9 @@
 
 #define SHIBE_ENUM(NAME, GROUP, FLAGS, EFFECT, DESC) SHIBE_OP_ ## NAME,
 
-typedef enum : uint8_t {
+SHIBE_FIXED_ENUM(shibe_opcode_t, uint8_t,
 	SHIBE_OPCODE(SHIBE_ENUM)
-} shibe_opcode_t;
+);
 
 _Static_assert(sizeof(shibe_opcode_t) == 1, "An opcode must fit in a byte to be bundled");
 

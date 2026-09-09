@@ -7,21 +7,64 @@ concurrency:
 on:
   - push
 jobs:
+  # The sanitizer build. cmake/linux.cmake puts asan and ubsan on Debug, which
+  # the steam runtime sdk cannot do, so this is where that coverage lives.
+  linux:
+    name: Linux Debug (${{ matrix.dispatch.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dispatch:
+          - { id: 0, name: computed-goto }
+          - { id: 1, name: switched-goto }
+          - { id: 2, name: switch }
+    env:
+      BUILD_TYPE: Debug
+      SHIBE_DISPATCH_METHOD: ${{ matrix.dispatch.id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # cmake/linux.cmake asks for clang and links with mold
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          create-symlink: true
+          key: ccache-${{ github.job }}-${{ matrix.dispatch.id }}
+          max-size: 500M
+
+      - name: Install CMake
+        uses: ssrobins/install-cmake@v1
+
+      - name: Build
+        run: cmd/linux/build
+
+      - name: Test
+        run: cmd/linux/run
+
+  # A consumer runtime, so it only builds what consumers get
   steamrt:
-    name: SteamRT (${{ matrix.build_type }}, ${{ matrix.dispatch.name }})
+    name: SteamRT (${{ matrix.dispatch.name }})
     runs-on: ubuntu-latest
     container:
       image: registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk:latest
     strategy:
       fail-fast: false
       matrix:
-        build_type: [Debug, RelWithDebInfo]
         dispatch:
           - { id: 0, name: computed-goto }
           - { id: 1, name: switched-goto }
           - { id: 2, name: switch }
     env:
-      BUILD_TYPE: ${{ matrix.build_type }}
+      BUILD_TYPE: RelWithDebInfo
       SHIBE_DISPATCH_METHOD: ${{ matrix.dispatch.id }}
       RELOADABLE: OFF
     steps:
@@ -34,7 +77,7 @@ jobs:
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           create-symlink: true
-          key: ccache-${{ github.job }}-${{ matrix.build_type }}-${{ matrix.dispatch.id }}
+          key: ccache-${{ github.job }}-${{ matrix.dispatch.id }}
           max-size: 500M
 
       - name: Build

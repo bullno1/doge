@@ -8,6 +8,16 @@
 #define SHIBE_API
 #endif
 
+// C23 lets an enum name its underlying type. MSVC has not implemented that even
+// under /std:clatest
+#ifndef SHIBE_FIXED_ENUM
+#	if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L && !defined(_MSC_VER)
+#		define SHIBE_FIXED_ENUM(NAME, TYPE, ...) typedef enum : TYPE { __VA_ARGS__ } NAME
+#	else
+#		define SHIBE_FIXED_ENUM(NAME, TYPE, ...) enum NAME { __VA_ARGS__ }; typedef TYPE NAME
+#	endif
+#endif
+
 typedef struct shibe_vm_s shibe_vm_t;
 
 typedef union {
@@ -73,10 +83,12 @@ typedef struct {
 	shibe_exec_state_t exec_state;
 } shibe_state_t;
 
-// The fixed underlying type keeps the enumeration constants unsigned. Without
-// it they are `int`, and shifting one into the region field of an address
-// (`SHIBE_MEM_REGION_7 << 29`) overflows and is undefined
-typedef enum : uint32_t {
+// The underlying type keeps the enumeration constants unsigned.
+// Without it they are `int`, and shifting one into the region field of an address
+// (`SHIBE_MEM_REGION_7 << 29`) overflows and is undefined. Where the compiler
+// cannot spell it the constants go back to being `int`.
+// Therefore, build addresses with shibe_mem_addr rather than by hand.
+SHIBE_FIXED_ENUM(shibe_mem_region_t, uint32_t,
 	SHIBE_MEM_REGION_0,
 	SHIBE_MEM_REGION_1,
 	SHIBE_MEM_REGION_2,
@@ -85,7 +97,7 @@ typedef enum : uint32_t {
 	SHIBE_MEM_REGION_5,
 	SHIBE_MEM_REGION_6,
 	SHIBE_MEM_REGION_7,
-} shibe_mem_region_t;
+);
 
 typedef struct shibe_allocator_s shibe_allocator_t;
 struct shibe_allocator_s {
