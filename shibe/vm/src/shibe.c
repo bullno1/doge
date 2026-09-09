@@ -285,11 +285,47 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 		return SHIBE_ERROR;
 	}
 
-	if (vm->state.exec_state != SHIBE_EXEC_IDLE) {
+	// A host callback is allowed to call back in on the same vm, so a run may
+	// start on top of one that is already going
+	shibe_exec_state_t caller_state = vm->state.exec_state;
+	if (caller_state != SHIBE_EXEC_IDLE && caller_state != SHIBE_EXEC_RUNNING) {
 		shibe_panic(vm, &(shibe_panic_t){
 			.error = SHIBE_ERR_INVALID,
 		});
 		return SHIBE_ERROR;
+	}
+
+	// Both stacks and all of the other registers stay shared, which is how
+	// arguments and results cross the boundary. `ip` and `fp` belong to a
+	// single activation, so the caller's are put back below.
+	shibe_cell_t caller_ip = vm->state.ip;
+	shibe_cell_t caller_fp = vm->state.fp;
+	uint32_t caller_asp = vm->state.asp.u32;
+	bool nested = caller_state == SHIBE_EXEC_RUNNING;
+
+	if (nested) {
+		// Record the boundary on the auxiliary stack so a stack walker can
+		// cross it. The caller's `ip` goes where a CALL would have left its
+		// return address, under a header whose creator is 0.
+		if (vm->config.as_len - caller_asp < SHIBE_AUX_REENTRY_LEN) {
+			shibe_panic(vm, &(shibe_panic_t){
+				.error = SHIBE_ERR_STACK_OVERFLOW,
+				.arg = SHIBE_STACK_AS,
+			});
+			return SHIBE_ERROR;
+		}
+
+		shibe_cell_t* as = vm->state.as;
+		as[caller_asp + 0] = caller_ip;
+		as[caller_asp + 1] = vm->state.dsp;
+		as[caller_asp + 2] = caller_fp;
+		as[caller_asp + 3] = vm->state.tm;
+		// Nothing else can produce this: address 0 is reserved, so no ENTER
+		// operand cell ever lives there
+		as[caller_asp + 4] = SHIBE_ZERO;
+
+		vm->state.fp.u32 = caller_asp + SHIBE_AUX_REENTRY_LEN;
+		vm->state.asp.u32 = caller_asp + SHIBE_AUX_REENTRY_LEN;
 	}
 
 	vm->state.ip = addr;
@@ -297,11 +333,35 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 
 	// Creating 2 separate versions is the only way to have optimized opcode
 	// dispatch when no debug hook is attached
+	shibe_status_t status;
 	if (vm->config.host->debug == NULL) {
-		return shibe_execute_without_hook(vm);
+		status = shibe_execute_without_hook(vm);
 	} else {
-		return shibe_execute_with_hook(vm);
+		status = shibe_execute_with_hook(vm);
 	}
+
+	// Hand the outer run its activation back. A panic or a suspension is left
+	// where it stopped: it ends the whole nest, there is nowhere to record an
+	// outer activation for a resume to come back to, and leaving the boundary
+	// frame in place is what lets the host walk the stack afterwards.
+	if (nested && status == SHIBE_OK) {
+		// The entry point has to be a stub that halts, so it must give the
+		// auxiliary stack back exactly as it found it
+		if (vm->state.asp.u32 != caller_asp + SHIBE_AUX_REENTRY_LEN
+		 || vm->state.fp.u32 != caller_asp + SHIBE_AUX_REENTRY_LEN) {
+			shibe_panic(vm, &(shibe_panic_t){
+				.error = SHIBE_ERR_INVALID,
+			});
+			return SHIBE_ERROR;
+		}
+
+		vm->state.asp.u32 = caller_asp;
+		vm->state.fp = caller_fp;
+		vm->state.ip = caller_ip;
+		vm->state.exec_state = SHIBE_EXEC_RUNNING;
+	}
+
+	return status;
 }
 
 // The interpreter is compiled into this file, so exec.h must not stand in for

@@ -55,11 +55,6 @@
 // out, which keeps that test off the per opcode path entirely.
 #define SHIBE_OP_ENDB 0xffu
 
-// The frame header is saved_dsp, saved_fp, saved_tm, creator, in that order.
-// `fp` points just past it, so the four sit at fp-4 .. fp-1, which is what the
-// negative AGET indices in shibe/opcode.h address.
-#define SHIBE_AUX_HEADER_LEN 4
-
 #ifndef SHIBE_EXEC_INLINED
 static void
 shibe_panic(shibe_vm_t* vm, const shibe_panic_t* panic) { (void)vm; (void)panic; }
@@ -129,10 +124,6 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 		(vm)->state = (state); \
 		(vm)->state.exec_state = exec_state_; \
 	} while (0)
-
-// A SHIBE_ERR_STACK_* panic carries which stack it was about in its `arg`
-#define SHIBE_STACK_DS ((shibe_cell_t){ .u32 = 0 })
-#define SHIBE_STACK_AS ((shibe_cell_t){ .u32 = 1 })
 
 #define SHIBE_FAULT(ERROR, ARG) \
 	do { \

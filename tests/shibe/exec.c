@@ -69,6 +69,55 @@ failing_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state,
 	return SHIBE_ERROR;
 }
 
+// The stub a compiler would emit for an exported word, re-entered by the
+// callback below
+static shibe_cell_t nested_entry;
+
+static shibe_status_t
+reentrant_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host; (void)index;
+	++num_extcalls;
+	return shibe_execute(called, nested_entry);
+}
+
+// Reads the host boundary out of the auxiliary stack from inside a nested run
+static shibe_cell_t observed_creator;
+static shibe_cell_t observed_outer_ip;
+static shibe_cell_t observed_saved_fp;
+
+static shibe_status_t
+inspecting_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host; (void)index;
+	++num_extcalls;
+
+	const shibe_state_t* st = shibe_inspect(called);
+	uint32_t fp = st->fp.u32;
+	// creator sits at fp-1, and the outer run's resume point one cell under the
+	// four cell header
+	observed_creator = st->as[fp - 1];
+	observed_saved_fp = st->as[fp - 3];
+	observed_outer_ip = st->as[fp - 5];
+	return SHIBE_OK;
+}
+
+// Call 1 re-enters, call 2 reads the boundary the re-entry left behind
+static shibe_status_t
+boundary_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	return index.u32 == 1
+		? reentrant_extcall(host, called, index)
+		: inspecting_extcall(host, called, index);
+}
+
+// Re-enters over and over without ever completing, to exhaust the aux stack
+static shibe_cell_t recursive_entry;
+
+static shibe_status_t
+recursing_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host; (void)index;
+	++num_extcalls;
+	return shibe_execute(called, recursive_entry);
+}
+
 static void
 exec_init_per_test(void) {
 	init_per_test();
@@ -77,6 +126,9 @@ exec_init_per_test(void) {
 	test_host.extcall = NULL;
 	num_steps = 0;
 	num_extcalls = 0;
+	observed_creator = (shibe_cell_t){ .u32 = 0xffffffffu };
+	observed_outer_ip = (shibe_cell_t){ 0 };
+	observed_saved_fp = (shibe_cell_t){ 0 };
 	last_extcall = (shibe_cell_t){ 0 };
 
 	code = shibe_alloc(vm, SHIBE_MEM_REGION_1, (shibe_cell_t){ .u32 = CODE_LEN });
@@ -522,4 +574,125 @@ BTEST(sexec, debug_hook_failure_panics) {
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_HOST);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
+}
+
+BTEST(sexec, host_can_re_enter_the_vm) {
+	test_host.extcall = reentrant_extcall;
+
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+
+	// The outer run, which calls out and then keeps going
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	LIT(5);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	// `LIT target; CALL; HALT`: the CALL and the RET below balance on the
+	// auxiliary stack, and the HALT hands control back to the host rather than
+	// popping a return address belonging to the outer run
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	LIT(7);
+	EMIT(RET);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 1);
+	// The nested run left 7 on the shared stack and the outer resumed where it
+	// had left off, so it added its own 5
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 12);
+	// Balanced, so the outer run's auxiliary stack came back untouched
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sexec, re_entry_while_suspended_is_rejected) {
+	test_host.extcall = suspending_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_ASSERT_EQUAL("%d", num_panics, 0);
+
+	// Only IDLE and RUNNING are re-entrant; a suspended run has to be resumed
+	BTEST_EXPECT_EQUAL("%d", shibe_execute(vm, code), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+}
+
+BTEST(sexec, re_entry_leaves_a_walkable_boundary) {
+	test_host.extcall = boundary_extcall;
+
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+
+	// The outer run resumes at the bundle after this one, which is what the
+	// boundary has to record
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	shibe_cell_t outer_resume = shibe_asm_here(sasm);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	// The nested run calls out again, and that callback reads the boundary
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT(RET);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+
+	// A creator of 0 is what marks the frame as the host's
+	BTEST_EXPECT_EQUAL("%u", observed_creator.u32, 0u);
+	// and the cell under the header carries the outer run on
+	BTEST_EXPECT_EQUAL("%u", observed_outer_ip.u32, outer_resume.u32);
+	// saved_fp chains back to the outer run, which never entered a frame
+	BTEST_EXPECT_EQUAL("%u", observed_saved_fp.u32, 0u);
+	// and the boundary was popped again on the way out
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->fp.u32, 0u);
+}
+
+BTEST(sexec, unbalanced_re_entry_stub_is_caught) {
+	test_host.extcall = reentrant_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	// A stub that opens a frame and never closes it, which would otherwise
+	// leave the outer run's auxiliary stack somewhere it never put it
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	EMIT_IMM(ENTER, ((shibe_cell_t){ .u32 = 0 }));
+	EMIT(HALT);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+}
+
+BTEST(sexec, re_entry_exhausting_the_aux_stack_panics_once) {
+	test_host.extcall = recursing_extcall;
+
+	// Re-enters itself, so every level costs a boundary frame and none of them
+	// ever unwind
+	recursive_entry = code;
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT(num_extcalls > 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_STACK_OVERFLOW);
+	BTEST_EXPECT_EQUAL("%u", last_panic.arg.u32, 1u);
+	// Relayed back up through every level without being raised again
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 }

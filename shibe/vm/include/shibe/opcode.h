@@ -134,7 +134,29 @@
  *
  * `UNWIND` works the same way as `LEAVE` but with the following addition:
  *
- * * `dsp = saved_dsp`
+ * - `dsp = saved_dsp`
+ *
+ * A re-entry from the host, `shibe_execute` called from inside a callback, pushes
+ * a frame of its own which consists of:
+ *
+ * - The outer run's `ip` where a `CALL` would have left its return address
+ * - A header whose `creator` is **0**.
+ *
+ * Address 0 is reserved for special markers. No real `ENTER` operand cell can
+ * ever land there and the value is unambiguous.
+ *
+ * A stack walker has to test `creator` against 0 before it reads a frame:
+ *
+ * - The frame belongs to the host, not to any word, so there is no `ENTER` site
+ *   to name it by and no slot count to read back from `creator`.
+ * - Everything above it belongs to a nested run. Attributing those calls to the
+ *   frame below the boundary would be wrong.
+ * - The cell under the header is where the outer run resumes, which is what
+ *   lets a trace carry on past the boundary.
+ *
+ * `UNWIND` has to stop there for the same reason: unwinding past a live host
+ * call would strand the host's own frame and return into a vm that had been
+ * unwound out from under it.
  *
  * The data slots can be accessed with `AGET n` and `ASET n`.
  * `AGET` takes a signed index, so a frame can read its own header:

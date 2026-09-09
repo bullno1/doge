@@ -5,6 +5,19 @@
 
 #define SHIBE_ZERO ((shibe_cell_t){ 0 })
 
+// A SHIBE_ERR_STACK_* panic carries which stack it was about in its `arg`
+#define SHIBE_STACK_DS ((shibe_cell_t){ .u32 = 0 })
+#define SHIBE_STACK_AS ((shibe_cell_t){ .u32 = 1 })
+
+// The frame header is saved_dsp, saved_fp, saved_tm, creator, in that order.
+// `fp` points just past it, so the four sit at fp-4 .. fp-1, which is what the
+// negative AGET indices in shibe/opcode.h address.
+#define SHIBE_AUX_HEADER_LEN 4
+
+// A re-entry from the host lays down the outer run's `ip` where a CALL would
+// have left its return address, then a header of its own on top of it
+#define SHIBE_AUX_REENTRY_LEN (1 + SHIBE_AUX_HEADER_LEN)
+
 #define BSEG_API static inline
 // Number of doubling segments that fit in the SHIBE_MEM_INDEX_BITS index space.
 // Segment 0 is 2^BSEG_SKIPPED_SEGMENTS elements, so:

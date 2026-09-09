@@ -143,6 +143,29 @@ shibe_push(shibe_vm_t* vm, shibe_cell_t item);
 SHIBE_API shibe_cell_t
 shibe_pop(shibe_vm_t* vm);
 
+/**
+ * Run from `addr` until HALT, a fault, or a suspension
+ *
+ * Callable from inside a host callback to re-enter the same vm. The entry point
+ * of such a call has to return to the host rather than run off the end of the
+ * outer run's auxiliary stack, so it must be a stub that halts, of the shape
+ * `LIT target; CALL; HALT`. The CALL and its RET balance out on the auxiliary
+ * stack, leaving the outer run's frames untouched.
+ *
+ * A re-entry pushes a frame of its own so that a stack walker can cross the
+ * host boundary. The frame consists of:
+ *
+ * - The outer run's `ip` where a CALL would have left its return
+ * - An auxiliary frame header whose `creator` is 0
+ *
+ * See shibe/opcode.h for the layout and what a walker has to do about it.
+ *
+ * A stub that does not hand the auxiliary stack back as it found it panics with
+ * SHIBE_ERR_INVALID rather than corrupting the outer run.
+ *
+ * A panic or a suspension inside a nested run ends the whole nest. The boundary
+ * frame is left in place so the host can still walk the stack afterwards.
+ */
 SHIBE_API shibe_status_t
 shibe_execute(shibe_vm_t* vm, shibe_cell_t addr);
 
