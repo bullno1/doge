@@ -569,6 +569,13 @@ shibe_call_continuation(shibe_vm_t* vm, uint32_t fp, shibe_cell_t continuation) 
 		return SHIBE_ERROR;
 	}
 
+	// Being called consumes it. A second half that means to stop again, or to
+	// start a run that might, has to name the next one out loud rather than
+	// inherit the one that brought it here: that value was chosen for a
+	// suspension that has already been dealt with, so acting on it again is a
+	// bug every time.
+	vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION] = SHIBE_ZERO;
+
 	vm->hfp = fp;
 	vm->state.exec_state = SHIBE_EXEC_RUNNING;
 	shibe_status_t status = host->extcall(host, vm, continuation);
@@ -626,16 +633,33 @@ shibe_resume(shibe_vm_t* vm) {
 		if (!shibe_is_host_frame(vm, fp)) { break; }
 
 		shibe_cell_t continuation = vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION];
-		if (continuation.u32 == 0) { break; }
+		if (continuation.u32 == 0) {
+			// Every frame the unwind reaches was orphaned by the suspension,
+			// and one that named nothing could not have suspended in the first
+			// place, so this is a frame nothing can take back
+			shibe_panic(vm, &(shibe_panic_t){
+				.error = SHIBE_ERR_INVALID,
+			});
+			return SHIBE_ERROR;
+		}
 
 		shibe_cell_t outer_ip = vm->state.as[fp + SHIBE_AUX_HOST_OUTER_IP];
 
 		status = shibe_call_continuation(vm, fp, continuation);
 		if (status == SHIBE_ERROR) { return SHIBE_ERROR; }
 		if (status == SHIBE_SUSPENDED) {
-			// The frame stays exactly where it is, and so does the continuation
+			if (vm->state.exec_state != SHIBE_EXEC_SUSPENDED) {
+				// It stopped on its own, not relaying the result so it must have
+				// a frame with continuation
+				if (vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) {
+					shibe_panic(vm, &(shibe_panic_t){
+						.error = SHIBE_ERR_INVALID,
+					});
+					return SHIBE_ERROR;
+				}
+				vm->suspension.at_continuation = true;
+			}
 			vm->state.exec_state = SHIBE_EXEC_SUSPENDED;
-			vm->suspension.at_continuation = true;
 			return SHIBE_SUSPENDED;
 		}
 

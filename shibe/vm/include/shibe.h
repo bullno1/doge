@@ -261,6 +261,10 @@ shibe_get_frame(shibe_vm_t* vm);
  * Slot 0 is reserved to mean "unbound", so leaving it unset, or setting it back
  * to 0, marks the next run as non-suspendable, and any attempt to suspend it
  * panics with `SHIBE_ERR_INVALID`.
+ *
+ * If a continuation makes another suspendable call to the VM again, it has
+ * to call this function again to set an appropriate continuation which is
+ * usually not htis one.
  */
 SHIBE_API void
 shibe_set_continuation(shibe_vm_t* vm, shibe_frame_t frame, shibe_cell_t continuation);

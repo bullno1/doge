@@ -213,7 +213,12 @@ retrying_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
 		case 2:
 			return SHIBE_SUSPENDED;
 		default:
-			if (++num_continuations < 3) { return SHIBE_SUSPENDED; }
+			if (++num_continuations < 3) {
+				// Being called consumed the continuation, so asking to be
+				// called again has to be said rather than inherited
+				shibe_set_continuation(called, shibe_get_frame(called), index);
+				return SHIBE_SUSPENDED;
+			}
 			shibe_push(called, (shibe_cell_t){ .i32 = 7 });
 			return SHIBE_OK;
 	}
@@ -248,6 +253,71 @@ bad_local_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
 	shibe_frame_t frame = shibe_alloc_frame(called, frame_locals);
 	observed_slot = shibe_get_local(called, frame, bad_local);
 	return SHIBE_OK;
+}
+
+static int num_deep_calls;
+
+// Call 1 re-enters and call 2 suspends that run. Call 3, the second half, grows
+// the frame it was reached through and re-enters again, so when call 2 stops the
+// second run the continuation is relaying rather than stopping on its own. Call
+// 7 is what finally finishes call 1, and call 8 marks the far side of each
+// suspension so an abandoned run shows up.
+static shibe_status_t
+reentering_continuation_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host;
+	++num_extcalls;
+
+	switch (index.u32) {
+		case 1: {
+			shibe_frame_t frame = shibe_alloc_frame(called, 1);
+			shibe_set_local(called, frame, 0, (shibe_cell_t){ .i32 = 11 });
+			shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 3 });
+			return shibe_execute(called, nested_entry);
+		}
+		case 2:
+			return SHIBE_SUSPENDED;
+		case 3: {
+			++num_continuations;
+			// Asking again inside a continuation grows the frame it was
+			// reached through, since that frame is this call's
+			shibe_frame_t frame = shibe_alloc_frame(called, 2);
+			shibe_set_local(called, frame, 1, (shibe_cell_t){ .i32 = 22 });
+			shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 7 });
+			return shibe_execute(called, nested_entry);
+		}
+		case 7: {
+			++num_continuations;
+			shibe_frame_t frame = shibe_get_frame(called);
+			observed_slot = shibe_get_local(called, frame, 0);
+			observed_frame_head = shibe_get_local(called, frame, 1);
+			shibe_push(called, (shibe_cell_t){ .i32 = 7 });
+			return SHIBE_OK;
+		}
+		default:
+			++num_deep_calls;
+			return SHIBE_OK;
+	}
+}
+
+// A second half that stops again without naming the next one, leaving a frame
+// nothing could ever take back
+static shibe_status_t
+forgetful_continuation_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host;
+	++num_extcalls;
+
+	switch (index.u32) {
+		case 1: {
+			shibe_frame_t frame = shibe_alloc_frame(called, 0);
+			shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 3 });
+			return shibe_execute(called, nested_entry);
+		}
+		case 3:
+			++num_continuations;
+			return SHIBE_SUSPENDED;
+		default:
+			return SHIBE_SUSPENDED;
+	}
 }
 
 // Call 1 stops the run; call 5 is the second half of the host function that
@@ -350,6 +420,7 @@ exec_init_per_test(void) {
 	num_continuations = 0;
 	frame_locals = 0;
 	bad_local = 0;
+	num_deep_calls = 0;
 
 	code = shibe_alloc(vm, SHIBE_MEM_REGION_1, (shibe_cell_t){ .u32 = CODE_LEN });
 	sasm = shibe_asm_begin(vm, exec_allocator, code);
@@ -1025,6 +1096,83 @@ BTEST(sexec, nested_run_can_suspend_with_a_continuation) {
 	// Everything was handed back on the way out
 	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_IDLE);
+}
+
+BTEST(sexec, a_continuation_that_names_no_successor_is_rejected) {
+	test_host.extcall = forgetful_continuation_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT(RET);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+
+	// Being called consumed the continuation, so stopping again without naming
+	// one leaves a frame nothing can finish. Inheriting the value that reached
+	// it would call the same second half over and over instead.
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_continuations, 1);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
+}
+
+BTEST(sexec, a_continuation_can_re_enter_and_suspend) {
+	test_host.extcall = reentering_continuation_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	LIT(5);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	// Call 8 sits on the far side of the suspension, so it only runs if the run
+	// that stopped there was actually carried on
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 8 }));
+	EMIT(RET);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%d", num_deep_calls, 0);
+
+	// The first run finishes, then the continuation starts a second one that
+	// stops in the same place. It is relaying, so the next resume has to carry
+	// that run on rather than call the continuation over again.
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%d", num_continuations, 1);
+	BTEST_EXPECT_EQUAL("%d", num_deep_calls, 1);
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_continuations, 2);
+	// Both runs reached the far side, so neither was dropped
+	BTEST_EXPECT_EQUAL("%d", num_deep_calls, 2);
+
+	// The frame grew inside the continuation rather than being replaced, so
+	// what the first half put in it is still there
+	BTEST_EXPECT_EQUAL("%d", observed_slot.i32, 11);
+	BTEST_EXPECT_EQUAL("%d", observed_frame_head.i32, 22);
+
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 12);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
 }
 
 BTEST(sexec, a_continuation_can_suspend_again) {
