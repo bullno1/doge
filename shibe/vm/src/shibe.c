@@ -709,6 +709,10 @@ shibe_resume(shibe_vm_t* vm) {
 	return status;
 }
 
+#define BSEG_REALLOC(ptr, size, ctx) shibe_realloc(ptr, size, ctx)
+#define BSEG_IMPLEMENTATION
+#include <bseg.h>
+
 // The interpreter is compiled into this file, so exec.h must not stand in for
 // anything it already has
 #define SHIBE_EXEC_INLINED
@@ -723,7 +727,3 @@ shibe_resume(shibe_vm_t* vm) {
 #define SHIBE_VM_EXECUTE shibe_execute_with_hook
 #define SHIBE_HAS_HOOK 1
 #include "exec.h"
-
-#define BSEG_REALLOC(ptr, size, ctx) shibe_realloc(ptr, size, ctx)
-#define BSEG_IMPLEMENTATION
-#include <bseg.h>

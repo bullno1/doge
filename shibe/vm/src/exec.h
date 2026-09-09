@@ -73,6 +73,45 @@ shibe_mem_ref(shibe_vm_t* vm, shibe_cell_t addr) {
 	return index < bseg_len(*seg) ? bseg_ref(*seg, index) : NULL;
 }
 
+// A run of cells that plain indexing can reach, so that instruction fetch does
+// not pay for a full address resolution on every bundle and every immediate.
+//
+// `addr` carries the region bits, so an address in another region falls out of
+// range on its own and no region check is needed on the fast path.
+typedef struct {
+	uint32_t addr;
+	uint32_t len;
+	shibe_cell_t* base;
+} shibe_span_t;
+
+// Locate the span holding `addr`: its bseg segment, clipped to the region's
+// allocated length. A segment is separately allocated, so a span never crosses
+// one, and clipping to the length folds the bounds check into the range test.
+//
+// The result stays good for the length of a run. Segments are stable once
+// allocated and growth only appends, so a cached span can go stale only by
+// being shorter than the region now is, which costs a re-locate and never a
+// wrong answer.
+//
+// Returns false when `addr` is out of bounds, leaving `span` untouched.
+static inline bool
+shibe_span_locate(shibe_vm_t* vm, shibe_cell_t addr, shibe_span_t* span) {
+	shibe_mem_seg_t* seg = &vm->regions[shibe_mem_region(addr)];
+	uint32_t index = shibe_mem_index(addr);
+	size_t len = bseg_len(*seg);
+	if (index >= len) { return false; }
+
+	int segment = bseg__segment_of(index);
+	size_t base = bseg__capacity_for(segment);
+	size_t end = base + bseg__segment_len(segment);
+	if (end > len) { end = len; }
+
+	span->addr = addr.u32 - index + (uint32_t)base;
+	span->len = (uint32_t)(end - base);
+	span->base = bseg_ref(*seg, base);
+	return true;
+}
+
 // Bulk cell copy with memmove semantics. Both ranges are checked before
 // anything is written, so a copy that faults leaves memory untouched. Staying
 // within bseg_len also keeps it inside one region.
@@ -278,14 +317,28 @@ shibe_host_call_end(
 		SHIBE_LOAD_STATE(vm, state); \
 	} while (0)
 
-// Reads the operand cell the instruction stream is sitting on
-#define SHIBE_IMM(OUT) \
+// Reads the cell `ip` names and steps over it.
+//
+// The span cache carries the common case: a subtract, an unsigned compare and
+// an indexed load. Only a fetch that leaves the cached span pays for the
+// segment lookup, and because the test is on the address rather than on a
+// walking pointer, a jump whose target is still in the span stays on the fast
+// path too.
+#define SHIBE_FETCH_IP(OUT) \
 	do { \
-		shibe_cell_t* imm_ = shibe_mem_ref(vm, state.ip); \
-		if (imm_ == NULL) { SHIBE_FAULT(SHIBE_ERR_MEM_FAULT, state.ip); } \
+		uint32_t off_ = state.ip.u32 - span.addr; \
+		if (off_ >= span.len) { \
+			if (!shibe_span_locate(vm, state.ip, &span)) { \
+				SHIBE_FAULT(SHIBE_ERR_MEM_FAULT, state.ip); \
+			} \
+			off_ = state.ip.u32 - span.addr; \
+		} \
 		state.ip.u32 += 1; \
-		(OUT) = *imm_; \
+		(OUT) = span.base[off_]; \
 	} while (0)
+
+// Reads the operand cell the instruction stream is sitting on
+#define SHIBE_IMM(OUT) SHIBE_FETCH_IP(OUT)
 
 // Depth is checked once per handler, then the slots are addressed directly.
 // SHIBE_DS(0) is the top of the stack.
@@ -332,11 +385,10 @@ shibe_host_call_end(
 
 #define SHIBE_REFILL() \
 	do { \
-		shibe_cell_t* bundle_ = shibe_mem_ref(vm, state.ip); \
-		if (bundle_ == NULL) { SHIBE_FAULT(SHIBE_ERR_MEM_FAULT, state.ip); } \
+		shibe_cell_t bundle_; \
 		SHIBE_TRACE_REFILL(); \
-		state.ip.u32 += 1; \
-		win = (uint64_t)bundle_->u32 | ((uint64_t)SHIBE_OP_ENDB << 32); \
+		SHIBE_FETCH_IP(bundle_); \
+		win = (uint64_t)bundle_.u32 | ((uint64_t)SHIBE_OP_ENDB << 32); \
 	} while (0)
 
 // Dispatch methods {{{
@@ -554,6 +606,12 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 	// also all a resume has to do, since nothing may stop anywhere but a bundle
 	// boundary.
 	uint64_t win = SHIBE_OP_ENDB;
+
+	// Where instruction fetch is reading from. A zero span has no cells in it,
+	// so the first fetch of the run always goes and locates one. A resume gets a
+	// fresh one for the same reason: it re-enters here with the span empty.
+	shibe_span_t span = { 0 };
+
 	SHIBE_TRACE_DECL();
 
 	SHIBE_BEGIN_DISPATCH()

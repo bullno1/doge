@@ -208,6 +208,30 @@ BTEST(sexec, runs_across_bundles) {
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 }
 
+// Instruction fetch reads through a cached span of cells it can reach by plain
+// indexing, and a bseg segment bounds that span: segment 0 of a region holds 64
+// cells, the next 128, the next 256. Code long enough to run past those
+// boundaries makes the fetch re-locate part way through.
+BTEST(sexec, runs_across_segments) {
+	enum { INCREMENTS = 200 };
+
+	LIT(0);
+	for (int i = 0; i < INCREMENTS; ++i) {
+		LIT(1);
+		EMIT(ADD);
+	}
+	EMIT(HALT);
+
+	// Nothing is being tested unless the code reaches past the boundary at 64
+	// and the one at 192
+	BTEST_EXPECT(shibe_asm_here(sasm).u32 > code.u32 + 192u);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, INCREMENTS);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
 BTEST(sexec, stack_shuffling) {
 	LIT(1); LIT(2); LIT(3);
 	// a b c -- b c a

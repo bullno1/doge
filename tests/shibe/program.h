@@ -11,7 +11,9 @@
 static shibe_barena_t program_arena;
 static shibe_allocator_t* program_allocator;
 
-#define CODE_LEN 64u
+// Big enough that a region spans several bseg segments, so a run can cross a
+// segment boundary. See sexec/runs_across_segments.
+#define CODE_LEN 512u
 
 static shibe_cell_t code;
 static shibe_asm_t* sasm;
