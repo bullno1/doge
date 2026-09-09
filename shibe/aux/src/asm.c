@@ -227,10 +227,10 @@ shibe_asm_here(const shibe_asm_t* sasm) {
 	return (shibe_cell_t){ .u32 = sasm->start_addr.u32 + index };
 }
 
-void
-shibe_asm_emit(shibe_asm_t* sasm, shibe_opcode_t opcode) {
-	if (sasm->failed) { return; }
-
+// Writes the opcode into the open bundle without checking its operand, which
+// the callers below have already done
+static void
+shibe_asm_emit_op(shibe_asm_t* sasm, shibe_opcode_t opcode) {
 	if (sasm->offset >= SHIBE_ASM_BUNDLE_LEN) {
 		shibe_asm_open_bundle(sasm);
 		if (sasm->failed) { return; }
@@ -238,11 +238,40 @@ shibe_asm_emit(shibe_asm_t* sasm, shibe_opcode_t opcode) {
 
 	sasm->bundle[sasm->offset++] = opcode;
 	bseg_at(sasm->code, sasm->cursor) = shibe_pack(sasm->bundle);
+
+	// Nothing may share a bundle with a control transfer: the cell after this
+	// bundle's operands has to be the next instruction. The slots left behind
+	// keep the NOP they were opened with rather than becoming TRAP, so a
+	// conditional branch that is not taken can run through them.
+	if (shibe_opcode_flags(opcode) & SHIBE_OPCODE_FLAG_ENDS_BUNDLE) {
+		sasm->offset = SHIBE_ASM_BUNDLE_LEN;
+	}
+}
+
+void
+shibe_asm_emit(shibe_asm_t* sasm, shibe_opcode_t opcode) {
+	if (sasm->failed) { return; }
+
+	// Without its operand cell the vm would take whatever follows as one
+	if (shibe_opcode_flags(opcode) & SHIBE_OPCODE_FLAG_IMM) {
+		sasm->failed = true;
+		return;
+	}
+
+	shibe_asm_emit_op(sasm, opcode);
 }
 
 void
 shibe_asm_emit_imm(shibe_asm_t* sasm, shibe_opcode_t opcode, shibe_cell_t operand) {
-	shibe_asm_emit(sasm, opcode);
+	if (sasm->failed) { return; }
+
+	// The vm would never consume the cell and would run it as a bundle
+	if (!(shibe_opcode_flags(opcode) & SHIBE_OPCODE_FLAG_IMM)) {
+		sasm->failed = true;
+		return;
+	}
+
+	shibe_asm_emit_op(sasm, opcode);
 	if (sasm->failed) { return; }
 
 	shibe_asm_push_cell(sasm, operand);
@@ -252,7 +281,12 @@ void
 shibe_asm_emit_imm_label(shibe_asm_t* sasm, shibe_opcode_t opcode, shibe_asm_label_t label) {
 	if (!shibe_asm_valid_label(sasm, label)) { return; }
 
-	shibe_asm_emit(sasm, opcode);
+	if (!(shibe_opcode_flags(opcode) & SHIBE_OPCODE_FLAG_IMM)) {
+		sasm->failed = true;
+		return;
+	}
+
+	shibe_asm_emit_op(sasm, opcode);
 	if (sasm->failed) { return; }
 
 	uint32_t index = shibe_asm_push_cell(sasm, (shibe_cell_t){ 0 });

@@ -9,8 +9,9 @@
 #define SHIBE_OPCODE_FLAG_NONE        0
 // Consumes the operand cell that follows the bundle
 #define SHIBE_OPCODE_FLAG_IMM         (1u << 0)
-// Must occupy the last slot of its bundle, so that the cell after the bundle's
-// operands is the next instruction. Every opcode that transfers control or
+// No opcode may follow it in its bundle, so that the cell after the bundle's
+// operands is the next instruction. The assembler closes the bundle after one,
+// padding the unused slots with NOP. Every opcode that transfers control or
 // suspends needs this, or there is no address to come back to. HALT carries it
 // so that no unreachable slot is emitted after it. TRAP does not, because the
 // assembler fills the leftover slots of a bundle with it.

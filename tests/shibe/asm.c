@@ -56,17 +56,17 @@ BTEST(sasm, bundling) {
 	shibe_asm_t* a = shibe_asm_begin(vm, asm_allocator, code);
 	BTEST_ASSERT(a != NULL);
 
-	// Four immediate-taking opcodes share one bundle; their operands follow it
-	// in emission order
+	// Immediate-taking opcodes share one bundle; their operands follow it in
+	// emission order
 	shibe_asm_emit_imm(a, SHIBE_OP_LIT, (shibe_cell_t){ .i32 = 42 });
 	shibe_asm_emit_imm(a, SHIBE_OP_AGET, (shibe_cell_t){ .u32 = 1 });
-	shibe_asm_emit_imm(a, SHIBE_OP_EXTCALL, (shibe_cell_t){ .u32 = 7 });
+	shibe_asm_emit_imm(a, SHIBE_OP_ASET, (shibe_cell_t){ .u32 = 7 });
 	shibe_asm_emit(a, SHIBE_OP_ADD);
 
 	BTEST_ASSERT(shibe_asm_end(a));
 
 	BTEST_EXPECT_EQUAL("%u", cell_at(code, 0).u32, bundle_of(
-		SHIBE_OP_LIT, SHIBE_OP_AGET, SHIBE_OP_EXTCALL, SHIBE_OP_ADD
+		SHIBE_OP_LIT, SHIBE_OP_AGET, SHIBE_OP_ASET, SHIBE_OP_ADD
 	).u32);
 	BTEST_EXPECT_EQUAL("%d", cell_at(code, 1).i32, 42);
 	BTEST_EXPECT_EQUAL("%u", cell_at(code, 2).u32, 1u);
@@ -120,16 +120,19 @@ BTEST(sasm, labels) {
 
 	BTEST_ASSERT(shibe_asm_end(a));
 
-	// Binding skip closed the bundle, so its 4th slot stayed NOP
+	// JZ ends its bundle, so JMP could not join it
 	BTEST_EXPECT_EQUAL("%u", cell_at(code, 0).u32, bundle_of(
-		SHIBE_OP_LIT, SHIBE_OP_JZ, SHIBE_OP_JMP, SHIBE_OP_NOP
+		SHIBE_OP_LIT, SHIBE_OP_JZ, SHIBE_OP_NOP, SHIBE_OP_NOP
 	).u32);
 	BTEST_EXPECT_EQUAL("%u", cell_at(code, 1).u32, 0u);
-	// skip lands after the three operand cells
-	BTEST_EXPECT_EQUAL("%u", cell_at(code, 2).u32, code.u32 + 4);
-	BTEST_EXPECT_EQUAL("%u", cell_at(code, 3).u32, code.u32);
-	BTEST_EXPECT_EQUAL("%u", cell_at(code, 4).u32, bundle_of(
-		SHIBE_OP_HALT, SHIBE_OP_TRAP, SHIBE_OP_TRAP, SHIBE_OP_TRAP
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 2).u32, code.u32 + 5);
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 3).u32, bundle_of(
+		SHIBE_OP_JMP, SHIBE_OP_NOP, SHIBE_OP_NOP, SHIBE_OP_NOP
+	).u32);
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 4).u32, code.u32);
+	// A bundle closed by a control transfer keeps its NOP padding
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 5).u32, bundle_of(
+		SHIBE_OP_HALT, SHIBE_OP_NOP, SHIBE_OP_NOP, SHIBE_OP_NOP
 	).u32);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 }
@@ -156,7 +159,7 @@ BTEST(sasm, data) {
 	BTEST_EXPECT_EQUAL("%u", cell_at(code, 1).u32, 0xdeadu);
 	BTEST_EXPECT_EQUAL("%u", cell_at(code, 2).u32, code.u32 + 3);
 	BTEST_EXPECT_EQUAL("%u", cell_at(code, 3).u32, bundle_of(
-		SHIBE_OP_HALT, SHIBE_OP_TRAP, SHIBE_OP_TRAP, SHIBE_OP_TRAP
+		SHIBE_OP_HALT, SHIBE_OP_NOP, SHIBE_OP_NOP, SHIBE_OP_NOP
 	).u32);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 }
@@ -173,6 +176,84 @@ BTEST(sasm, unbound_label_writes_nothing) {
 	BTEST_EXPECT(!shibe_asm_end(a));
 
 	// The vm never saw any of it
+	for (uint32_t i = 0; i < CODE_LEN; ++i) {
+		BTEST_EXPECT_EQUAL("%u", cell_at(code, i).u32, 0u);
+	}
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sasm, control_transfer_ends_bundle) {
+	shibe_cell_t code = alloc_code();
+	shibe_asm_t* a = shibe_asm_begin(vm, asm_allocator, code);
+	BTEST_ASSERT(a != NULL);
+
+	shibe_asm_label_t skip = shibe_asm_make_label(a);
+
+	shibe_asm_emit(a, SHIBE_OP_ADD);
+	shibe_asm_emit_imm_label(a, SHIBE_OP_JZ, skip);
+	// Cannot join the bundle JZ is in, however much room is left
+	shibe_asm_emit(a, SHIBE_OP_SUB);
+	shibe_asm_bind_label(a, skip);
+	shibe_asm_emit(a, SHIBE_OP_MUL);
+
+	BTEST_ASSERT(shibe_asm_end(a));
+
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 0).u32, bundle_of(
+		SHIBE_OP_ADD, SHIBE_OP_JZ, SHIBE_OP_NOP, SHIBE_OP_NOP
+	).u32);
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 1).u32, code.u32 + 3);
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 2).u32, bundle_of(
+		SHIBE_OP_SUB, SHIBE_OP_NOP, SHIBE_OP_NOP, SHIBE_OP_NOP
+	).u32);
+	// A bundle that no control transfer closed still traps on the way out
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 3).u32, bundle_of(
+		SHIBE_OP_MUL, SHIBE_OP_TRAP, SHIBE_OP_TRAP, SHIBE_OP_TRAP
+	).u32);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sasm, missing_immediate_writes_nothing) {
+	shibe_cell_t code = alloc_code();
+	shibe_asm_t* a = shibe_asm_begin(vm, asm_allocator, code);
+	BTEST_ASSERT(a != NULL);
+
+	// LIT reads the cell after the bundle, so without one the vm would take
+	// whatever happens to follow
+	shibe_asm_emit(a, SHIBE_OP_LIT);
+
+	BTEST_EXPECT(!shibe_asm_end(a));
+	for (uint32_t i = 0; i < CODE_LEN; ++i) {
+		BTEST_EXPECT_EQUAL("%u", cell_at(code, i).u32, 0u);
+	}
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sasm, unwanted_immediate_writes_nothing) {
+	shibe_cell_t code = alloc_code();
+	shibe_asm_t* a = shibe_asm_begin(vm, asm_allocator, code);
+	BTEST_ASSERT(a != NULL);
+
+	// ADD takes nothing from the instruction stream, so the operand cell would
+	// be reached and run as a bundle
+	shibe_asm_emit_imm(a, SHIBE_OP_ADD, (shibe_cell_t){ .u32 = 1 });
+
+	BTEST_EXPECT(!shibe_asm_end(a));
+	for (uint32_t i = 0; i < CODE_LEN; ++i) {
+		BTEST_EXPECT_EQUAL("%u", cell_at(code, i).u32, 0u);
+	}
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sasm, unwanted_immediate_label_writes_nothing) {
+	shibe_cell_t code = alloc_code();
+	shibe_asm_t* a = shibe_asm_begin(vm, asm_allocator, code);
+	BTEST_ASSERT(a != NULL);
+
+	shibe_asm_label_t target = shibe_asm_make_label(a);
+	shibe_asm_emit_imm_label(a, SHIBE_OP_ADD, target);
+	shibe_asm_bind_label(a, target);
+
+	BTEST_EXPECT(!shibe_asm_end(a));
 	for (uint32_t i = 0; i < CODE_LEN; ++i) {
 		BTEST_EXPECT_EQUAL("%u", cell_at(code, i).u32, 0u);
 	}
