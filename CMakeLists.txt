@@ -51,4 +51,5 @@ set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
 set(CMAKE_INSTALL_RPATH "\${ORIGIN}")
 
 add_subdirectory(shibe)
+add_subdirectory(doge)
 add_subdirectory(tests)

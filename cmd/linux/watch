@@ -2,7 +2,7 @@
 
 cmd/linux/build || true
 
-inotifywait -r -e CLOSE_WRITE -m shibe tests deps | \
+inotifywait -r -e CLOSE_WRITE -m shibe doge tests deps | \
     while read path action file
 	do
 		clear
