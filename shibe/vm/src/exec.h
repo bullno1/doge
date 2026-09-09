@@ -156,60 +156,126 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 // is, so a debug hook inspects the vm as it stands rather than a value arranged
 // for it. `CAN_SUSPEND` is whether that address describes where the run actually
 // is - a callback that stops where it does not panics instead.
+// What has to be put back when the callback returns. It rides the C stack
+// across the call rather than the register file, so the interpreter's `state`
+// never has its address taken and stays in registers.
+typedef struct {
+	shibe_cell_t saved_ip;
+	shibe_cell_t saved_fp;
+	shibe_cell_t saved_resume_ip;
+	shibe_cell_t resume_ip;
+	uint32_t saved_asp;
+	uint32_t saved_hfp;
+	bool saved_can_suspend;
+	bool can_suspend;
+} shibe_host_call_t;
+
+static inline shibe_host_call_t
+shibe_host_call_begin(shibe_vm_t* vm, shibe_cell_t resume_ip, bool can_suspend) {
+	shibe_host_call_t call = {
+		.saved_ip = vm->state.ip,
+		.saved_fp = vm->state.fp,
+		.saved_asp = vm->state.asp.u32,
+		.saved_hfp = vm->hfp,
+		.saved_can_suspend = vm->can_suspend,
+		.saved_resume_ip = vm->resume_ip,
+		.resume_ip = resume_ip,
+		.can_suspend = can_suspend,
+	};
+	vm->hfp = 0;
+	vm->resume_ip = resume_ip;
+	vm->can_suspend = can_suspend;
+	return call;
+}
+
+// Everything a host call has to sort out once the callback is back. It works on
+// `vm->state`, which the caller wrote the register file into, so nothing here
+// needs to reach into the interpreter's locals.
+//
+// Returns SHIBE_OK when the run carries on, otherwise the status the run has to
+// end with. The interpreter never returns SHIBE_OK from a host call site, so
+// there is no ambiguity in reusing it to mean "carry on".
+static shibe_status_t
+shibe_host_call_end(
+	shibe_vm_t* vm,
+	const shibe_host_call_t* call,
+	shibe_status_t status,
+	shibe_error_t error,
+	shibe_cell_t arg,
+	shibe_cell_t resume_ip
+) {
+	uint32_t host_fp = vm->hfp;
+	vm->hfp = call->saved_hfp;
+	vm->resume_ip = call->saved_resume_ip;
+	vm->can_suspend = call->saved_can_suspend;
+
+	bool relayed = vm->state.exec_state == SHIBE_EXEC_SUSPENDED;
+	if (relayed && status == SHIBE_OK) { status = SHIBE_SUSPENDED; }
+
+	if (status == SHIBE_OK && !shibe_panicked(vm)) {
+		vm->state.ip = call->saved_ip;
+		vm->state.asp.u32 = call->saved_asp;
+		vm->state.fp = call->saved_fp;
+	}
+
+	if (shibe_panicked(vm)) { return SHIBE_ERROR; }
+
+	if (status == SHIBE_ERROR) {
+		shibe_panic(vm, &(shibe_panic_t){ .error = error, .arg = arg });
+		return SHIBE_ERROR;
+	}
+
+	if (status == SHIBE_SUSPENDED) {
+		if (!relayed) {
+			if (!call->can_suspend) {
+				shibe_panic(vm, &(shibe_panic_t){
+					.error = SHIBE_ERR_NOT_SUSPENDABLE,
+				});
+				return SHIBE_ERROR;
+			}
+			if (host_fp != 0) {
+				// A frame nobody can finish would strand both itself and
+				// whatever ran under it
+				if (vm->state.as[host_fp + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) {
+					shibe_panic(vm, &(shibe_panic_t){
+						.error = SHIBE_ERR_NOT_SUSPENDABLE,
+						.arg = (shibe_cell_t){ .u32 = host_fp },
+					});
+					return SHIBE_ERROR;
+				}
+				vm->at_continuation = true;
+			}
+		}
+		// Only now does `ip` become the resume point: while the callback was
+		// running it was the cursor, which is what it really was.
+		//
+		// `resume_ip` is read again here rather than reused from `begin`: for an
+		// EXTCALL it is `ip` itself, and a nested run that suspended underneath
+		// has already moved it to where that run stopped. Coming back to the
+		// outer call site instead would lose the inner activation.
+		vm->state.ip = resume_ip;
+		vm->state.exec_state = SHIBE_EXEC_SUSPENDED;
+		return SHIBE_SUSPENDED;
+	}
+
+	return SHIBE_OK;
+}
+
 #define SHIBE_HOST_CALL(CALL, ERROR, ARG, RESUME_IP, CAN_SUSPEND) \
 	do { \
-		shibe_cell_t call_ip_ = state.ip; \
-		uint32_t call_asp_ = state.asp.u32; \
-		shibe_cell_t call_fp_ = state.fp; \
-		uint32_t call_hfp_ = vm->hfp; \
-		bool call_can_suspend_ = vm->can_suspend; \
-		shibe_cell_t call_resume_ip_ = vm->resume_ip; \
 		SHIBE_SAVE_STATE(vm, state); \
-		vm->hfp = 0; \
-		vm->resume_ip = (RESUME_IP); \
-		vm->can_suspend = (CAN_SUSPEND); \
+		shibe_host_call_t call_ = \
+			shibe_host_call_begin(vm, (RESUME_IP), (CAN_SUSPEND)); \
 		shibe_status_t host_status_ = (CALL); \
-		uint32_t host_fp_ = vm->hfp; \
-		vm->hfp = call_hfp_; \
-		vm->resume_ip = call_resume_ip_; \
-		vm->can_suspend = call_can_suspend_; \
-		bool relayed_ = vm->state.exec_state == SHIBE_EXEC_SUSPENDED; \
-		if (relayed_ && host_status_ == SHIBE_OK) { host_status_ = SHIBE_SUSPENDED; } \
+		/* The register file has to be back in `state` before RESUME_IP is read: \
+		 * for an EXTCALL that expression is `ip`, and what it should name is \
+		 * where the callback left the run, not where it started */ \
 		SHIBE_LOAD_STATE(vm, state); \
-		if (host_status_ == SHIBE_OK && !shibe_panicked(vm)) { \
-			state.ip = call_ip_; \
-			state.asp.u32 = call_asp_; \
-			state.fp = call_fp_; \
-		} \
-		if (shibe_panicked(vm)) { \
-			SHIBE_SAVE_STATE(vm, state); \
-			return SHIBE_ERROR; \
-		} \
-		if (host_status_ == SHIBE_ERROR) { SHIBE_FAULT((ERROR), (ARG)); } \
-		if (host_status_ == SHIBE_SUSPENDED) { \
-			if (!relayed_) { \
-				if (!(CAN_SUSPEND)) { \
-					SHIBE_FAULT(SHIBE_ERR_NOT_SUSPENDABLE, SHIBE_ZERO); \
-				} \
-				if (host_fp_ != 0) { \
-					/* A frame nobody can finish would strand both itself and \
-					 * whatever ran under it */ \
-					if (vm->state.as[host_fp_ + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) { \
-						SHIBE_FAULT( \
-							SHIBE_ERR_NOT_SUSPENDABLE, \
-							((shibe_cell_t){ .u32 = host_fp_ }) \
-						); \
-					} \
-					vm->at_continuation = true; \
-				} \
-			} \
-			/* Only now does `ip` become the resume point: while the callback \
-			 * was running it was the cursor, which is what it really was */ \
-			state.ip = (RESUME_IP); \
-			SHIBE_SAVE_STATE(vm, state); \
-			vm->state.exec_state = SHIBE_EXEC_SUSPENDED; \
-			return SHIBE_SUSPENDED; \
-		} \
+		host_status_ = shibe_host_call_end( \
+			vm, &call_, host_status_, (ERROR), (ARG), (RESUME_IP) \
+		); \
+		if (host_status_ != SHIBE_OK) { return host_status_; } \
+		SHIBE_LOAD_STATE(vm, state); \
 	} while (0)
 
 // Reads the operand cell the instruction stream is sitting on
