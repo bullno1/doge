@@ -132,32 +132,67 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 		return SHIBE_ERROR; \
 	} while (0)
 
-// What to make of the status a host callback returned.
+// Calls a host callback and makes what it returned mean something.
 //
-// The callback may have failed on its own, or it may be relaying a panic that
+// The callback runs with the vm's registers written back, so it can reach in
+// through the public api, and with an activation of its own: `hfp` starts empty,
+// so a frame it opens is its own rather than its caller's. Anything it left on
+// the auxiliary stack belongs to that call, so a callback that returns normally
+// has it taken back here. A suspension or a panic keeps it: the frame is what a
+// resume finishes the call through, and what a stack walker reads afterwards.
+//
+// The callback may have failed on its own, or it may be relaying something that
 // was already raised on this vm from underneath it: by a nested shibe_execute,
-// or by any public api call that faulted. Only the first of those is a new
-// panic. Re-raising the second would fire the host's panic handler a second
-// time and overwrite the original reason with the host's, losing it.
+// or by any public api call that faulted. Only the first of those is new. A
+// re-raised panic would fire the host's panic handler a second time and lose the
+// original reason, and a re-recorded suspension would overwrite where the inner
+// run comes back to, which is the one a resume continues. `exec_state` tells the
+// two apart, and a vm that is already panicked wins over whatever the callback
+// returned: one that panics the vm and then reports SHIBE_OK is still a stop.
 //
-// A vm that is already panicked wins over whatever the callback returned: a
-// callback that panics the vm and then reports SHIBE_OK is still a stop.
-//
-// A suspension has no such second reading. Only a run the host started from the
-// outside may suspend: shibe_execute turns a nested one into a panic, which
-// arrives above as a panicked vm. Therefore, a suspension here is always this
-// run's own, and `RESUME_WIN` is where it comes back to.
-#define SHIBE_HOST_RESULT(STATUS, ERROR, ARG, RESUME_WIN) \
+// A suspension that is this call's own is recorded one of two ways. A callback
+// holding a frame stopped after whatever it ran had finished, so there is no
+// interpreter state to come back to and the resume starts by finishing that
+// frame. Otherwise the run itself is what stopped, and `RESUME_WIN` is where it
+// picks up.
+#define SHIBE_HOST_CALL(CALL, ERROR, ARG, RESUME_WIN) \
 	do { \
-		shibe_status_t host_status_ = (STATUS); \
+		shibe_cell_t call_ip_ = state.ip; \
+		uint32_t call_asp_ = state.asp.u32; \
+		shibe_cell_t call_fp_ = state.fp; \
+		uint32_t call_hfp_ = vm->hfp; \
+		SHIBE_SAVE_STATE(vm, state); \
+		vm->hfp = 0; \
+		shibe_status_t host_status_ = (CALL); \
+		uint32_t host_fp_ = vm->hfp; \
+		vm->hfp = call_hfp_; \
+		bool relayed_ = vm->state.exec_state == SHIBE_EXEC_SUSPENDED; \
+		SHIBE_LOAD_STATE(vm, state); \
+		if (host_status_ == SHIBE_OK && !shibe_panicked(vm)) { \
+			state.ip = call_ip_; \
+			state.asp.u32 = call_asp_; \
+			state.fp = call_fp_; \
+		} \
 		if (shibe_panicked(vm)) { \
 			SHIBE_SAVE_STATE(vm, state); \
 			return SHIBE_ERROR; \
 		} \
 		if (host_status_ == SHIBE_ERROR) { SHIBE_FAULT((ERROR), (ARG)); } \
 		if (host_status_ == SHIBE_SUSPENDED) { \
-			vm->suspension.win = (RESUME_WIN); \
-			SHIBE_TRACE_SAVE(); \
+			if (!relayed_) { \
+				if (host_fp_ != 0) { \
+					/* A frame nobody can finish would strand both itself and \
+					 * whatever ran under it */ \
+					if (vm->state.as[host_fp_ + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) { \
+						SHIBE_FAULT(SHIBE_ERR_INVALID, SHIBE_ZERO); \
+					} \
+					vm->suspension.at_continuation = true; \
+				} else { \
+					vm->suspension.win = (RESUME_WIN); \
+					vm->suspension.at_continuation = false; \
+					SHIBE_TRACE_SAVE(); \
+				} \
+			} \
 			SHIBE_SAVE_STATE(vm, state); \
 			vm->state.exec_state = SHIBE_EXEC_SUSPENDED; \
 			return SHIBE_SUSPENDED; \
@@ -394,13 +429,11 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 				armed = true; \
 			} else if (opcode != SHIBE_OP_ENDB) { \
 				at.slot += 1; \
-				SHIBE_SAVE_STATE(vm, state); \
-				shibe_status_t hook_ = host->debug(host, vm, &vm->state, at); \
-				SHIBE_LOAD_STATE(vm, state); \
 				/* The opcode has not run yet, so the window it came out of is \
 				 * where a resume has to start */ \
-				SHIBE_HOST_RESULT( \
-					hook_, SHIBE_ERR_HOOK, SHIBE_ZERO, (win << 8) | opcode \
+				SHIBE_HOST_CALL( \
+					host->debug(host, vm, &vm->state, at), \
+					SHIBE_ERR_HOOK, SHIBE_ZERO, (win << 8) | opcode \
 				); \
 			} \
 		} while (0)
@@ -744,16 +777,14 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm, bool resuming) {
 			SHIBE_FAULT(SHIBE_ERR_UNBOUND, index);
 		}
 
-		// The host reaches back in through the public api, which works on
-		// vm->state, so the registers have to be visible to it
-		SHIBE_SAVE_STATE(vm, state);
-		shibe_status_t status = host->extcall(host, vm, index);
-		SHIBE_LOAD_STATE(vm, state);
 		// Nothing may follow an EXTCALL in its bundle and `ip` is already past
 		// the operand cell, so a resume has nothing left to dispatch: it starts
 		// on the pseudo opcode and refills, which is also what keeps the call
 		// from being made a second time
-		SHIBE_HOST_RESULT(status, SHIBE_ERR_EXTCALL, index, SHIBE_OP_ENDB);
+		SHIBE_HOST_CALL(
+			host->extcall(host, vm, index),
+			SHIBE_ERR_EXTCALL, index, SHIBE_OP_ENDB
+		);
 
 		SHIBE_NEXT_BUNDLE();
 	}

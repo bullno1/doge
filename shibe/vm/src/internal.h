@@ -14,9 +14,20 @@
 // negative AGET indices in shibe/opcode.h address.
 #define SHIBE_AUX_HEADER_LEN 4
 
-// A re-entry from the host lays down the outer run's `ip` where a CALL would
-// have left its return address, then a header of its own on top of it
-#define SHIBE_AUX_REENTRY_LEN (1 + SHIBE_AUX_HEADER_LEN)
+// A host frame lays three cells under the standard header:
+//
+// - Where the run that called out resumes. A CALL would have left its return
+//   address in the same place. 0 means there is no run underneath, which is
+//   what a frame opened by a top level call looks like.
+// - The extcall number that finishes the call after a suspension, 0 for none.
+// - How many slots follow, so a host accessor can bound them.
+#define SHIBE_AUX_HOST_HEADER_LEN (3 + SHIBE_AUX_HEADER_LEN)
+
+// Offsets from `fp`. The standard header occupies -1 .. -4, so the three cells
+// belonging to a host frame sit below it and out of AGET's reach.
+#define SHIBE_AUX_HOST_NUM_LOCALS    (-5)
+#define SHIBE_AUX_HOST_CONTINUATION (-6)
+#define SHIBE_AUX_HOST_OUTER_IP     (-7)
 
 #define BSEG_API static inline
 // Number of doubling segments that fit in the SHIBE_MEM_INDEX_BITS index space.
@@ -41,6 +52,10 @@ typedef struct {
 	// overwritten by the first refill, which is what every EXTCALL suspension
 	// starts with.
 	shibe_op_addr_t at;
+	// Set when a continuation was the one that suspended, rather than a run.
+	// There is no interpreter state to pick up in that case: the next resume
+	// goes straight back to calling the same continuation.
+	bool at_continuation;
 } shibe_suspension_t;
 
 struct shibe_vm_s {
@@ -50,6 +65,11 @@ struct shibe_vm_s {
 	shibe_mem_seg_t regions[8];
 
 	shibe_suspension_t suspension;
+
+	// The frame of the host call that is running, or 0 when none is running or
+	// the one that is did not ask for a frame. Frames nest with the C stack, so
+	// every callback site saves it and puts it back.
+	uint32_t hfp;
 
 	void* snapshot;
 };

@@ -117,6 +117,16 @@ typedef struct {
 	shibe_host_t* host;
 } shibe_config_t;
 
+/**
+ * A frame belonging to a host call, living on the auxiliary stack.
+ *
+ * Handed out by @ref shibe_alloc_frame and @ref shibe_get_frame.
+ */
+typedef struct { uint32_t fp; } shibe_frame_t;
+
+/*! The handle no frame ever has */
+#define SHIBE_NO_FRAME ((shibe_frame_t){ 0 })
+
 SHIBE_API shibe_vm_t*
 shibe_create(shibe_config_t config);
 
@@ -159,33 +169,103 @@ shibe_pop(shibe_vm_t* vm);
  * `LIT target; CALL; HALT`. The CALL and its RET balance out on the auxiliary
  * stack, leaving the outer run's frames untouched.
  *
- * A re-entry pushes a frame of its own so that a stack walker can cross the
- * host boundary. The frame consists of:
- *
- * - The outer run's `ip` where a CALL would have left its return
- * - An auxiliary frame header whose `creator` is 0
- *
+ * A re-entry implicitly pushes a frame if the caller has not allocated one yet.
  * See shibe/opcode.h for the layout and what a walker has to do about it.
  *
  * A stub that does not hand the auxiliary stack back as it found it panics with
- * SHIBE_ERR_INVALID rather than corrupting the outer run.
+ * `SHIBE_ERR_INVALID` rather than corrupting the outer run.
  *
- * A panic inside a nested run ends the whole chain. The boundary frame is left
- * in place so the host can still walk the stack afterwards.
+ * A panic inside a nested run ends the whole chain. The frames are left in place
+ * so the host can still walk the stack afterwards.
  *
- * A nested run may not suspend. It runs underneath a host call frame that is
- * gone by the time a resume could happen.
- * Any attempt to make a nested suspension by returning `SHIBE_SUSPENDED` from
- * a nested callback would result in a panic with `SHIBE_ERR_INVALID`.
+ * To make this call suspendable, the caller has to call @ref shibe_set_continuation.
+ * Otherwise, a call lower in the chain returning @ref SHIBE_SUSPENDED would panic
+ * with @ref SHIBE_ERR_INVALID instead.
  */
 SHIBE_API shibe_status_t
 shibe_execute(shibe_vm_t* vm, shibe_cell_t addr);
 
 /**
- * Continue an execution that a host callback suspended
+ * Give the running host function a frame with `num_locals` cells.
+ *
+ * A frame is where a host function can keep its data so that it can be inspected
+ * by the VM.
+ * For example, it can store `__FILE__` and `__LINE__` so a stack walker can
+ * even print out C frame's location interleaved with VM frames.
+ * In the case of suspension, this data would outlive the C stack frame.
+ *
+ * Allocating one before @ref shibe_execute, along with @ref
+ * shibe_set_continuation is what makes a host function resumable.
+ *
+ * A host call gets one frame however many times this is asked, so a second call
+ * grows it rather than stacking another.
+ *
+ * No freeing is needed when this is done within a callback. The VM will
+ * automatically free the frame when the callback returns without suspension.
+ *
+ * Returns `SHIBE_NO_FRAME` if the frame could not be allocated.
+ */
+SHIBE_API shibe_frame_t
+shibe_alloc_frame(shibe_vm_t* vm, uint32_t num_locals);
+
+/**
+ * Release a frame allocated outside of a callback.
+ *
+ * Only needed for a host function that allocated one outside of a callback
+ * and did not suspend.
+ */
+SHIBE_API void
+shibe_free_frame(shibe_vm_t* vm, shibe_frame_t frame);
+
+/**
+ * Retrieve a previously allocated frame.
+ *
+ * When a host function is suspended, it returns with @ref SHIBE_SUSPENDED and
+ * the C frame is destroyed.
+ * To resume its work, it needs to call @ref shibe_set_continuation.
+ * The continuation will be called when the VM is resumed through @ref shibe_resume.
+ *
+ * The frame is how continuations pass data from one to another or set the next
+ * continuation.
+ */
+SHIBE_API shibe_frame_t
+shibe_get_frame(shibe_vm_t* vm);
+
+/**
+ * Name the extcall that finishes this host call after a suspension.
+ *
+ * When a host function lower in the call chain returns `SHIBE_SUSPENDED`, the
+ * current execution is suspended. By the time @ref shibe_resume is called this
+ * function has already returned and cannot be restarted, so the vm makes an
+ * extcall to `continuation` instead, with `frame` in front of it.
+ *
+ * That call stands in for the rest of this function, and it has to leave the
+ * data stack the way the interrupted `EXTCALL` promised: it is that call,
+ * finished late.
+ *
+ * A function making several calls into the vm can name a different resume point
+ * before each one.
+ *
+ * Slot 0 is reserved to mean "unbound", so leaving it unset, or setting it back
+ * to 0, marks the next run as non-suspendable, and any attempt to suspend it
+ * panics with `SHIBE_ERR_INVALID`.
+ */
+SHIBE_API void
+shibe_set_continuation(shibe_vm_t* vm, shibe_frame_t frame, shibe_cell_t continuation);
+
+/*! Write one of a frame's locals. Out of range panics with `SHIBE_ERR_INVALID` */
+SHIBE_API void
+shibe_set_local(shibe_vm_t* vm, shibe_frame_t frame, uint32_t index, shibe_cell_t value);
+
+/*! Read one of a frame's locals. Out of range panics with `SHIBE_ERR_INVALID` */
+SHIBE_API shibe_cell_t
+shibe_get_local(shibe_vm_t* vm, shibe_frame_t frame, uint32_t index);
+
+/**
+ * Carry on a run that a host callback suspended
  *
  * A run suspends when the extcall handler or the debug hook returns
- * SHIBE_SUSPENDED. The host is free to work on the vm in between.
+ * `SHIBE_SUSPENDED`. The host is free to work on the vm in between.
  * Then, it could push a result and resume execution, turning an asynchronous
  * call into a synchronous blocking call for the VM.
  *
@@ -194,11 +274,13 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr);
  * - An extcall carries on after the call. It is not made a second time, so a
  *   handler that suspends runs its side of the call exactly once.
  * - The debug hook carries on at the instruction it was reporting, which had
- *   not run yet, and that instruction is not reported again. A hook that always
- *   suspends therefore single steps rather than standing still.
+ *   not run yet, and does not report it again. A hook that always suspends
+ *   therefore single steps rather than standing still.
  *
- * Anything other than a suspended vm panics with SHIBE_ERR_INVALID.
- * A panicked vm returns SHIBE_ERROR without panicking again, like shibe_execute.
+ * Anything other than a suspended vm panics with `SHIBE_ERR_INVALID`: an idle
+ * one has no execution to continue, a halted run is over for good, and a running
+ * one is already inside the interpreter. A panicked vm returns `SHIBE_ERROR`
+ * without panicking again, like @ref shibe_execute.
  */
 SHIBE_API shibe_status_t
 shibe_resume(shibe_vm_t* vm);

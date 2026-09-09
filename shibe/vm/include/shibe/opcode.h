@@ -136,11 +136,19 @@
  *
  * - `dsp = saved_dsp`
  *
- * A re-entry from the host, `shibe_execute` called from inside a callback, pushes
- * a frame of its own which consists of:
+ * A host call can take a frame of its own with `shibe_alloc_frame`, and
+ * `shibe_execute` opens an empty one for any re-entry that has not, so that the
+ * boundary is walkable. It lays three more cells under the header:
  *
- * - The outer run's `ip` where a `CALL` would have left its return address
- * - A header whose `creator` is **0**.
+ * - The `ip` of the run underneath, where a `CALL` would have left its return
+ *   address. **0** when there is no run underneath, which is what a frame opened
+ *   by a top level call looks like.
+ * - The extcall number that finishes the call after a suspension, **0** for a
+ *   call that cannot be suspended.
+ * - How many locals follow, since there is no `ENTER` site to read them back
+ *   from.
+ *
+ * Finally, its header's `creator` is **0**.
  *
  * Address 0 is reserved for special markers. No real `ENTER` operand cell can
  * ever land there and the value is unambiguous.
@@ -148,11 +156,14 @@
  * A stack walker has to test `creator` against 0 before it reads a frame:
  *
  * - The frame belongs to the host, not to any word, so there is no `ENTER` site
- *   to name it by and no slot count to read back from `creator`.
+ *   to name it by and the count is in the frame instead of behind `creator`.
  * - Everything above it belongs to a nested run. Attributing those calls to the
  *   frame below the boundary would be wrong.
- * - The cell under the header is where the outer run resumes, which is what
- *   lets a trace carry on past the boundary.
+ * - The locals are whatever the host put there, so a walker only knows what that
+ *   host's convention says. A call that stores its `__FILE__` and `__LINE__` is
+ *   what lets a trace name a C location between two vm frames.
+ * - The cell three under the header is where the run underneath resumes, which
+ *   is what lets a trace carry on past the boundary.
  *
  * `UNWIND` has to stop there for the same reason: unwinding past a live host
  * call would strand the host's own frame and return into a vm that had been
