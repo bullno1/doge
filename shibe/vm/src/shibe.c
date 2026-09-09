@@ -115,9 +115,11 @@ shibe_reset(shibe_vm_t* vm) {
 
 	vm->state.exec_state = SHIBE_EXEC_IDLE;
 	// The activation they belonged to is gone, so there is nothing to come back
-	// to and no host call left owning a frame
-	vm->suspension = (shibe_suspension_t){ 0 };
+	// to and no host call left owning a frame. Nothing is running either, so a
+	// suspension has somewhere to come back to again.
+	vm->at_continuation = false;
 	vm->hfp = 0;
+	vm->can_suspend = true;
 }
 
 shibe_cell_t
@@ -278,22 +280,21 @@ shibe_inspect(shibe_vm_t* vm) {
 }
 
 static shibe_status_t
-shibe_execute_with_hook(shibe_vm_t* vm, bool resuming);
+shibe_execute_with_hook(shibe_vm_t* vm);
 
 static shibe_status_t
-shibe_execute_without_hook(shibe_vm_t* vm, bool resuming);
+shibe_execute_without_hook(shibe_vm_t* vm);
 
 // Creating 2 separate versions is the only way to have optimized opcode
 // dispatch when no debug hook is attached. Which one runs is decided per run,
-// so a hook may be attached or dropped while a run is suspended: what carries
-// across is the suspension record, which both variants read and write the same
-// way.
+// so a hook may be attached or dropped while a run is suspended: nothing but
+// `ip` carries across, and both variants start from it the same way.
 static inline shibe_status_t
-shibe_run(shibe_vm_t* vm, bool resuming) {
+shibe_run(shibe_vm_t* vm) {
 	if (vm->config.host->debug == NULL) {
-		return shibe_execute_without_hook(vm, resuming);
+		return shibe_execute_without_hook(vm);
 	} else {
-		return shibe_execute_with_hook(vm, resuming);
+		return shibe_execute_with_hook(vm);
 	}
 }
 
@@ -311,12 +312,13 @@ shibe_open_host_frame(shibe_vm_t* vm, uint32_t num_locals) {
 		return false;
 	}
 
-	// A run that is going is the one this call interrupted, and its `ip` is
-	// where it carries on. A call made from outside the vm has nothing
-	// underneath it, and address 0 is reserved, so it cannot be mistaken for a
-	// resume point.
+	// A run that is going is the one this call interrupted, and the callback
+	// site said where it carries on - which is not always `ip`, since the debug
+	// hook is reached with the cursor already past the bundle it is reporting.
+	// A call made from outside the vm has nothing underneath it, and address 0
+	// is reserved, so it cannot be mistaken for a resume point.
 	shibe_cell_t outer_ip = vm->state.exec_state == SHIBE_EXEC_RUNNING
-		? vm->state.ip
+		? vm->resume_ip
 		: SHIBE_ZERO;
 
 	shibe_cell_t* as = vm->state.as;
@@ -448,6 +450,18 @@ shibe_alloc_frame(shibe_vm_t* vm, uint32_t num_locals) {
 void
 shibe_free_frame(shibe_vm_t* vm, shibe_frame_t frame) {
 	if (!shibe_check_frame(vm, frame)) { return; }
+
+	// Only a frame taken outside a callback is the host's to hand back. The vm
+	// takes a callback's own back when it returns, and letting the callback do
+	// it first would leave that restore working from a frame that is no longer
+	// there.
+	if (vm->state.exec_state == SHIBE_EXEC_RUNNING) {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_INVALID,
+		});
+		return;
+	}
+
 	shibe_close_host_frame(vm, frame.fp);
 }
 
@@ -518,7 +532,7 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	vm->state.ip = addr;
 	vm->state.exec_state = SHIBE_EXEC_RUNNING;
 
-	shibe_status_t status = shibe_run(vm, false);
+	shibe_status_t status = shibe_run(vm);
 
 	if (status == SHIBE_SUSPENDED) {
 		// A frame that outlives the suspension needs somebody to finish it:
@@ -526,8 +540,12 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 		// a continuation neither the frame nor whatever ran underneath it could
 		// ever be picked up again. A call that has no frame has nothing to come
 		// back to and needs none.
+		// A frame opened where the run underneath is mid bundle cannot say
+		// where that run carries on: it records an address, and no address
+		// describes a point inside a bundle
 		if (frame != 0
-		 && vm->state.as[frame + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) {
+		 && (!vm->can_suspend
+		  || vm->state.as[frame + SHIBE_AUX_HOST_CONTINUATION].u32 == 0)) {
 			shibe_panic(vm, &(shibe_panic_t){
 				.error = SHIBE_ERR_NOT_SUSPENDABLE,
 				.arg = { .u32 = frame },
@@ -614,24 +632,36 @@ shibe_resume(shibe_vm_t* vm) {
 
 	// Whatever the host did to the vm in the meantime stands: the registers and
 	// both stacks are read back as they are now, which is how an extcall that
-	// suspended leaves its result behind.
+	// suspended leaves its result behind. Nothing stops anywhere but a bundle
+	// boundary, so `ip` is the whole of where an interrupted run picks up and
+	// starting it again is an ordinary run.
 	shibe_status_t status;
-	if (vm->suspension.at_continuation) {
-		// A continuation was the one that suspended, so there is no run to pick
-		// up: go straight back to calling it
-		vm->suspension.at_continuation = false;
+	if (vm->at_continuation) {
+		// A callback was the one that stopped, after whatever it ran had already
+		// finished, so there is no run to pick up: go straight to its frame
+		vm->at_continuation = false;
 		status = SHIBE_OK;
 	} else {
 		vm->state.exec_state = SHIBE_EXEC_RUNNING;
-		status = shibe_run(vm, true);
+		status = shibe_run(vm);
 	}
 
 	// Every host frame still standing was orphaned by the suspension. Nothing
 	// is running underneath them, so each one is finished here, innermost
 	// first, and the run below it carried on.
 	while (status == SHIBE_OK) {
+		// Everything above the innermost host frame died with the run that
+		// halted, so frames that run left behind - which nothing stops a top
+		// level one from doing - must not hide the call underneath them. The
+		// chain strictly descends, and anything else is not one to follow.
 		uint32_t fp = vm->state.fp.u32;
-		if (!shibe_is_host_frame(vm, fp)) { break; }
+		while (fp != 0 && !shibe_is_host_frame(vm, fp)) {
+			uint32_t below = fp >= SHIBE_AUX_HEADER_LEN
+				? vm->state.as[fp - 3].u32
+				: 0;
+			fp = below < fp ? below : 0;
+		}
+		if (fp == 0) { break; }
 
 		shibe_cell_t continuation = vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION];
 		if (continuation.u32 == 0) {
@@ -660,7 +690,7 @@ shibe_resume(shibe_vm_t* vm) {
 					});
 					return SHIBE_ERROR;
 				}
-				vm->suspension.at_continuation = true;
+				vm->at_continuation = true;
 			}
 			vm->state.exec_state = SHIBE_EXEC_SUSPENDED;
 			return SHIBE_SUSPENDED;
@@ -677,7 +707,7 @@ shibe_resume(shibe_vm_t* vm) {
 
 		vm->state.ip = outer_ip;
 		vm->state.exec_state = SHIBE_EXEC_RUNNING;
-		status = shibe_run(vm, false);
+		status = shibe_run(vm);
 	}
 
 	return status;

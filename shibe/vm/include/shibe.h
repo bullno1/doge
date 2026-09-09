@@ -120,6 +120,11 @@ typedef struct {
 typedef struct shibe_host_s shibe_host_t;
 struct shibe_host_s {
 	void (*panic)(shibe_host_t* host, shibe_vm_t* vm, const shibe_panic_t* panic);
+	// Reported before each opcode runs.
+	//
+	// Returning SHIBE_SUSPENDED here suspends the run.
+	//
+	// This can only be done at the first opcode of a bundle (@see shibe_resume).
 	shibe_status_t (*debug)(shibe_host_t* host, shibe_vm_t* vm, const shibe_state_t* state, shibe_op_addr_t at);
 	shibe_status_t (*extcall)(shibe_host_t* host, shibe_vm_t* vm, shibe_cell_t index);
 };
@@ -292,9 +297,11 @@ shibe_get_local(shibe_vm_t* vm, shibe_frame_t frame, uint32_t index);
  *
  * - An extcall carries on after the call. It is not made a second time, so a
  *   handler that suspends runs its side of the call exactly once.
- * - The debug hook carries on at the instruction it was reporting, which had
- *   not run yet, and does not report it again. A hook that always suspends
- *   therefore single steps rather than standing still.
+ * - The debug hook may only stop at the first opcode of a bundle.
+ *   Stopping anywhere else panics with `SHIBE_ERR_NOT_SUSPENDABLE`.
+ *   The run carries on at that bundle, and its first opcode is reported a
+ *   second time, so a hook that stops on a condition has to account for having
+ *   just been resumed past it.
  *
  * Anything other than a suspended vm panics with `SHIBE_ERR_INVALID`: an idle
  * one has no execution to continue, a halted run is over for good, and a running

@@ -62,13 +62,22 @@ suspending_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
 	return SHIBE_SUSPENDED;
 }
 
-// Suspends on every single opcode, so a resume that reported the opcode it
-// picks up on all over again would never get anywhere
+// Stops once at the start of every bundle. Resuming reports the opcode it
+// stopped on again, so the hook has to remember where it last stopped or it
+// would ask for the same suspension for ever.
+static shibe_cell_t last_stop;
+static int num_stops;
+
 static shibe_status_t
-single_stepping_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
+stepping_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
 	(void)host; (void)hooked; (void)state;
 	if (num_steps < MAX_STEPS) { steps[num_steps] = at; }
 	++num_steps;
+
+	if (at.slot != 0 || at.bundle.u32 == last_stop.u32) { return SHIBE_OK; }
+
+	last_stop = at.bundle;
+	++num_stops;
 	return SHIBE_SUSPENDED;
 }
 
@@ -102,6 +111,22 @@ reentrant_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
 	(void)host; (void)index;
 	++num_extcalls;
 	return shibe_execute(called, nested_entry);
+}
+
+// Records what `ip` looks like to the hook, which is the cursor the instruction
+// stream has really reached rather than anything arranged for the hook
+static shibe_cell_t observed_hook_ip;
+static shibe_cell_t observed_first_ip;
+
+static shibe_status_t
+ip_watching_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
+	(void)host; (void)hooked;
+	if (num_steps < MAX_STEPS) { steps[num_steps] = at; }
+	++num_steps;
+	if (at.slot == 0) { observed_first_ip = state->ip; }
+	// The last slot of the bundle, well past the operands the earlier ones ate
+	if (at.slot == 3) { observed_hook_ip = state->ip; }
+	return SHIBE_OK;
 }
 
 // Reads the host boundary out of the auxiliary stack from inside a nested run
@@ -336,6 +361,41 @@ top_level_continuation_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cel
 	return SHIBE_SUSPENDED;
 }
 
+// Re-enters, is handed a suspension, and reports success anyway
+static shibe_status_t
+swallowing_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host;
+	++num_extcalls;
+	if (index.u32 != 1) { return SHIBE_SUSPENDED; }
+
+	shibe_frame_t frame = shibe_alloc_frame(called, 0);
+	shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 3 });
+	shibe_execute(called, nested_entry);
+	return SHIBE_OK;
+}
+
+// Call 1 stops the run; call 3 finishes it, but the run left a frame of its own
+// standing when it halted
+static shibe_status_t
+untidy_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host;
+	++num_extcalls;
+	if (index.u32 == 3) {
+		++num_continuations;
+		return SHIBE_OK;
+	}
+	return SHIBE_SUSPENDED;
+}
+
+// Hands back a frame the vm was going to take back itself
+static shibe_status_t
+early_free_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host; (void)index;
+	++num_extcalls;
+	shibe_free_frame(called, shibe_alloc_frame(called, 1));
+	return SHIBE_OK;
+}
+
 // Reaches for a frame the call never asked for
 static shibe_status_t
 frameless_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
@@ -421,6 +481,10 @@ exec_init_per_test(void) {
 	frame_locals = 0;
 	bad_local = 0;
 	num_deep_calls = 0;
+	last_stop = (shibe_cell_t){ 0 };
+	num_stops = 0;
+	observed_hook_ip = (shibe_cell_t){ .u32 = 0xffffffffu };
+	observed_first_ip = (shibe_cell_t){ .u32 = 0xffffffffu };
 
 	code = shibe_alloc(vm, SHIBE_MEM_REGION_1, (shibe_cell_t){ .u32 = CODE_LEN });
 	sasm = shibe_asm_begin(vm, exec_allocator, code);
@@ -460,6 +524,22 @@ run(void) {
 static inline uint32_t
 depth(void) {
 	return shibe_inspect(vm)->dsp.u32;
+}
+
+// Opens a frame inside a bundle, names a continuation for it, and re-enters.
+// The nested run then stops, which is a suspension that would have to cross a
+// frame recording a point no address can name.
+static shibe_status_t
+framed_reentering_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
+	(void)host; (void)state;
+	++num_steps;
+	if (at.bundle.u32 != suspend_at.bundle.u32 || at.slot != suspend_at.slot) {
+		return SHIBE_OK;
+	}
+
+	shibe_frame_t frame = shibe_alloc_frame(hooked, 0);
+	shibe_set_continuation(hooked, frame, (shibe_cell_t){ .u32 = 6 });
+	return shibe_execute(hooked, nested_entry);
 }
 
 BTEST(sexec, arithmetic) {
@@ -881,60 +961,134 @@ BTEST(sexec, extcall_resumes_after_the_call) {
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_IDLE);
 }
 
-BTEST(sexec, debug_hook_can_suspend_mid_bundle) {
+BTEST(sexec, a_hook_can_stop_at_the_start_of_a_bundle) {
 	test_host.debug = suspending_hook;
 
-	// One bundle of four opcodes, so the suspension lands in the middle of a
-	// window that the resume has to pick up where it was left
-	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 2 };
+	// Slot 0 is the only place the run can be come back to: nothing in the
+	// bundle has run and no operand has been consumed, so the bundle's own
+	// address says all of it
+	LIT(9);
+	shibe_asm_align(sasm);
+	shibe_cell_t second = shibe_asm_here(sasm);
 	LIT(1);
 	LIT(2);
 	EMIT(ADD);
 	EMIT(HALT);
+	suspend_at = (shibe_op_addr_t){ .bundle = second, .slot = 0 };
 
 	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
-	BTEST_EXPECT_EQUAL("%d", num_steps, 3);
-	// The hook reports an opcode before it runs, so the ADD has not happened
-	BTEST_EXPECT_EQUAL("%u", depth(), 2u);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	// The hook reports an opcode before it runs, so the bundle is untouched
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	// and `ip` is wound back to the bundle, which is where it carries on
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->ip.u32, second.u32);
+
+	// Resuming reports that opcode again, so a hook that stops on a condition
+	// has to account for having just been resumed past it
+	suspend_at = (shibe_op_addr_t){ 0 };
 
 	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
-	// The ADD ran without being reported again, and the HALT after it was
-	BTEST_EXPECT_EQUAL("%d", num_steps, 4);
-	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
-	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT_EQUAL("%u", depth(), 2u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 9);
 }
 
-BTEST(sexec, a_hook_that_always_suspends_single_steps) {
-	test_host.debug = single_stepping_hook;
+BTEST(sexec, the_hook_sees_the_vm_as_it_stands) {
+	test_host.debug = ip_watching_hook;
 
+	// `ip` is a cursor, not a pointer at the current instruction: a refill moves
+	// it past the bundle cell and every immediate moves it past an operand. The
+	// hook is shown that, rather than a resume point arranged for it - which
+	// opcode is being reported is what the position argument is for.
 	shibe_cell_t bundle = shibe_asm_here(sasm);
 	LIT(1);
 	LIT(2);
 	EMIT(ADD);
 	EMIT(HALT);
 
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_OK);
+	// Slot 0: past the bundle cell, no operand eaten yet
+	BTEST_EXPECT_EQUAL("%u", observed_first_ip.u32, bundle.u32 + 1u);
+	// Slot 3: both LIT operands eaten, so already into the next bundle
+	BTEST_EXPECT_EQUAL("%u", observed_hook_ip.u32, bundle.u32 + 3u);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sexec, a_frame_opened_inside_a_bundle_cannot_be_resumed_through) {
+	test_host.debug = framed_reentering_hook;
+	test_host.extcall = suspending_extcall;
+
+	// The frame records the bundle, which is not where a run two opcodes into
+	// it carries on. Nothing may reach that record: the suspension is refused
+	// as it crosses the frame, not left to be resumed into the wrong place.
+	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 2 };
+	LIT(1);
+	LIT(2);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT(RET);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_NOT_SUSPENDABLE);
+}
+
+BTEST(sexec, a_hook_may_not_stop_inside_a_bundle) {
+	test_host.debug = suspending_hook;
+
+	// No address describes a point inside a bundle: two opcodes have run and
+	// their operands are consumed, so there is nothing to come back to
+	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 2 };
+	LIT(1);
+	LIT(2);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_steps, 3);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_NOT_SUSPENDABLE);
+	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
+}
+
+BTEST(sexec, a_hook_steps_a_bundle_at_a_time) {
+	test_host.debug = stepping_hook;
+
+	// Two bundles, so two stops. Resuming reports the opcode it stopped on
+	// again, which is why the hook has to remember where it last stopped -
+	// without that it would ask for the same suspension for ever.
+	LIT(1);
+	LIT(2);
+	EMIT(ADD);
+	EMIT(DUP);
+	LIT(3);
+	EMIT(ADD);
+	EMIT(HALT);
+
 	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
 
-	// Four opcodes, so four suspensions and one resume that reaches the HALT.
-	// The bound is what fails the test if a resume ever stands still.
 	int num_resumes = 0;
 	shibe_status_t status;
 	while ((status = shibe_resume(vm)) == SHIBE_SUSPENDED && num_resumes < MAX_STEPS) {
 		++num_resumes;
 	}
+	// The bound is what fails this if a resume ever stands still
 	BTEST_EXPECT_EQUAL("%d", status, SHIBE_OK);
-	BTEST_EXPECT_EQUAL("%d", num_resumes, 3);
+	BTEST_EXPECT_EQUAL("%d", num_stops, 2);
 
-	// Every opcode was reported exactly once, in order
-	BTEST_ASSERT_EQUAL("%d", num_steps, 4);
-	for (uint8_t i = 0; i < 4; ++i) {
-		BTEST_EXPECT_EQUAL("%u", steps[i].bundle.u32, bundle.u32);
-		BTEST_EXPECT_EQUAL("%u", (unsigned)steps[i].slot, (unsigned)i);
-	}
-
-	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%u", depth(), 2u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 6);
 	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 }
@@ -942,21 +1096,22 @@ BTEST(sexec, a_hook_that_always_suspends_single_steps) {
 BTEST(sexec, the_hook_can_be_dropped_while_suspended) {
 	test_host.debug = suspending_hook;
 
-	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 2 };
+	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 0 };
 	LIT(1);
 	LIT(2);
 	EMIT(ADD);
 	EMIT(HALT);
 
 	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
-	BTEST_ASSERT_EQUAL("%d", num_steps, 3);
+	BTEST_ASSERT_EQUAL("%d", num_steps, 1);
 
-	// The two interpreter builds have to agree about where a suspended run is:
-	// this one is picked up by the one without a hook
+	// The two interpreter builds have to agree about where a suspended run is,
+	// and since that is only ever `ip`, this one is picked up by the build
+	// without a hook
 	test_host.debug = NULL;
 
 	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
-	BTEST_EXPECT_EQUAL("%d", num_steps, 3);
+	BTEST_EXPECT_EQUAL("%d", num_steps, 1);
 	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
 	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
@@ -1177,6 +1332,62 @@ BTEST(sexec, a_continuation_can_re_enter_and_suspend) {
 	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
 }
 
+// A hook that opens a frame and then stops. At slot 0 the frame's record of
+// where the run underneath carries on is the bundle itself, since `ip` is wound
+// back to it for the length of the call.
+static shibe_status_t
+framed_suspending_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
+	(void)host; (void)state;
+	++num_steps;
+	if (at.bundle.u32 != suspend_at.bundle.u32 || at.slot != suspend_at.slot) {
+		return SHIBE_OK;
+	}
+
+	shibe_frame_t frame = shibe_alloc_frame(hooked, 1);
+	shibe_set_local(hooked, frame, 0, (shibe_cell_t){ .i32 = 55 });
+	shibe_set_continuation(hooked, frame, (shibe_cell_t){ .u32 = 6 });
+	return SHIBE_SUSPENDED;
+}
+
+// The second half of the hook call above
+static shibe_status_t
+hook_continuation_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host; (void)index;
+	++num_continuations;
+	observed_slot = shibe_get_local(called, shibe_get_frame(called), 0);
+	return SHIBE_OK;
+}
+
+BTEST(sexec, a_hook_can_hold_a_frame_across_a_stop) {
+	test_host.debug = framed_suspending_hook;
+	test_host.extcall = hook_continuation_extcall;
+
+	// The hook is handed the bundle's own address, so a frame it opens records
+	// a point the run can come back to, exactly as an extcall's does
+	shibe_cell_t bundle = shibe_asm_here(sasm);
+	suspend_at = (shibe_op_addr_t){ .bundle = bundle, .slot = 0 };
+	LIT(1);
+	LIT(2);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT_EQUAL("%u", depth(), 0u);
+
+	suspend_at = (shibe_op_addr_t){ 0 };
+
+	// The hook's own second half runs first, then the bundle it stopped in
+	// front of
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_continuations, 1);
+	BTEST_EXPECT_EQUAL("%d", observed_slot.i32, 55);
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
+}
+
 BTEST(sexec, a_continuation_can_suspend_again) {
 	test_host.extcall = retrying_extcall;
 
@@ -1320,6 +1531,71 @@ BTEST(sexec, a_local_outside_the_frame_panics) {
 	test_host.extcall = bad_local_extcall;
 	frame_locals = 1;
 	bad_local = 1;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+}
+
+BTEST(sexec, a_swallowed_suspension_still_stops_the_run) {
+	test_host.extcall = swallowing_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	LIT(5);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT(RET);
+
+	// The callback reported success on top of a vm that was already suspended.
+	// Carrying on would abandon the run that stopped, so the vm's state wins,
+	// the same way a panic raised underneath a callback does.
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_SUSPENDED);
+}
+
+BTEST(sexec, a_run_that_halts_untidily_still_finds_its_host_frame) {
+	test_host.extcall = untidy_extcall;
+
+	// Nothing makes a top level run balance its frames before halting, and the
+	// call underneath must not go unfinished because one was left standing
+	shibe_asm_label_t frame_slots = shibe_asm_make_label(sasm);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	shibe_asm_emit_imm_label(sasm, SHIBE_OP_ENTER, frame_slots);
+	shibe_asm_bind_value(sasm, frame_slots, (shibe_cell_t){ .u32 = 0 });
+	EMIT(HALT);
+	BTEST_ASSERT(shibe_asm_end(sasm));
+
+	shibe_frame_t frame = shibe_alloc_frame(vm, 0);
+	shibe_set_continuation(vm, frame, (shibe_cell_t){ .u32 = 3 });
+
+	BTEST_ASSERT_EQUAL("%d", shibe_execute(vm, code), SHIBE_SUSPENDED);
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_continuations, 1);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	// The stray frame went with the run that left it
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
+}
+
+BTEST(sexec, freeing_a_callbacks_own_frame_is_rejected) {
+	// The vm takes a callback's frame back when it returns, so letting the
+	// callback drop it first would leave that restore working from a frame that
+	// is no longer there
+	test_host.extcall = early_free_extcall;
 
 	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
 	EMIT(HALT);

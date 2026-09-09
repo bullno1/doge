@@ -40,37 +40,35 @@
 
 typedef bseg(shibe_cell_t) shibe_mem_seg_t;
 
-// What a suspended run needs handed back that the register file does not carry:
-// where the interpreter was inside the bundle it was decoding.
-typedef struct {
-	// The decode window as the resumed run should see it. A run the debug hook
-	// suspended puts the opcode it stopped on back in, so that opcode is the
-	// first thing the resume dispatches. A run an EXTCALL suspended stores the
-	// bootstrap value instead: EXTCALL ends its bundle, so there is nothing
-	// left to dispatch and the resume refills from `ip`.
-	uint64_t win;
-	// Where the debug hook had got to. Meaningless without a hook, and
-	// overwritten by the first refill, which is what every EXTCALL suspension
-	// starts with.
-	shibe_op_addr_t at;
-	// Set when a continuation was the one that suspended, rather than a run.
-	// There is no interpreter state to pick up in that case: the next resume
-	// goes straight back to calling the same continuation.
-	bool at_continuation;
-} shibe_suspension_t;
-
 struct shibe_vm_s {
 	shibe_config_t config;
 	shibe_state_t state;
 
 	shibe_mem_seg_t regions[8];
 
-	shibe_suspension_t suspension;
-
 	// The frame of the host call that is running, or 0 when none is running or
 	// the one that is did not ask for a frame. Frames nest with the C stack, so
 	// every callback site saves it and puts it back.
 	uint32_t hfp;
+
+	// Whether the host call that is running is one a suspension can come back to.
+	// Everything a suspension is written down against is an address, which can
+	// only address anything at a bundle boundary.
+	// While EXTCALL ends its bundle, the hook stops in the middle of one, so it
+	// only qualifies at slot 0, where nothing in the bundle has run yet.
+	bool can_suspend;
+
+	// Where the run underneath the host call that is running carries on. For an
+	// EXTCALL that is `ip` itself, since nothing may follow one in its bundle;
+	// for the debug hook it is the bundle being reported, which `ip` has already
+	// moved past. Kept beside the register file rather than in it so that the
+	// hook is shown the vm as it really is.
+	shibe_cell_t resume_ip;
+
+	// Set when a callback stopped after whatever it ran had already finished.
+	// There is no run to pick up in that case: the resume starts by finishing
+	// that callback's frame through its continuation.
+	bool at_continuation;
 
 	void* snapshot;
 };

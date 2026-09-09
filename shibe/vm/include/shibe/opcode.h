@@ -136,34 +136,45 @@
  *
  * - `dsp = saved_dsp`
  *
- * A host call can take a frame of its own with `shibe_alloc_frame`, and
- * `shibe_execute` opens an empty one for any re-entry that has not, so that the
- * boundary is walkable. It lays three more cells under the header:
+ * A stack walker has to test `creator` against 0 before it reads a frame.
+ * Address 0 is reserved for special markers, and no real `ENTER` operand cell
+ * can ever land there, so the value is unambiguous.
  *
- * - The `ip` of the run underneath, where a `CALL` would have left its return
- *   address. **0** when there is no run underneath, which is what a frame opened
- *   by a top level call looks like.
- * - The extcall number that finishes the call after a suspension, **0** for a
- *   call that cannot be suspended.
- * - How many locals follow, since there is no `ENTER` site to read them back
- *   from.
+ * This is a host frame, which has a different structure:
  *
- * Finally, its header's `creator` is **0**.
+ * - resume_ip: Where the run underneath carries on. **0** when there is no run
+ *   underneath it
+ * - continuation: The extcall number that finishes the call after a suspension.
+ *   **0** for a call that cannot be suspended
+ * - num_locals: How many locals follow
+ * - saved_dsp, saved_fp, saved_tm: As in a frame `ENTER` built
+ * - creator: Always **0**, which is what marks the frame as a host call's
+ * - n locals: General purpose tail, as `ENTER`'s is
  *
- * Address 0 is reserved for special markers. No real `ENTER` operand cell can
- * ever land there and the value is unambiguous.
+ * `fp` points at the tail, so the header sits at `fp-1` .. `fp-4` exactly as it
+ * does for a word's frame, and the three cells above are at `fp-5` (num_locals),
+ * `fp-6` (continuation) and `fp-7` (resume_ip). `AGET` cannot reach past the
+ * header, so a word can read a host frame's locals but never its control cells.
  *
- * A stack walker has to test `creator` against 0 before it reads a frame:
+ * A host call takes one with `shibe_alloc_frame`, and `shibe_execute` opens an
+ * empty one for any re-entry that has not, so that the boundary is walkable.
+ *
+ * What a walker has to do differently:
  *
  * - The frame belongs to the host, not to any word, so there is no `ENTER` site
- *   to name it by and the count is in the frame instead of behind `creator`.
+ *   to name it by. That is why `num_locals` is in the frame rather than read
+ *   back from `creator`.
  * - Everything above it belongs to a nested run. Attributing those calls to the
  *   frame below the boundary would be wrong.
- * - The locals are whatever the host put there, so a walker only knows what that
- *   host's convention says. A call that stores its `__FILE__` and `__LINE__` is
- *   what lets a trace name a C location between two vm frames.
- * - The cell three under the header is where the run underneath resumes, which
- *   is what lets a trace carry on past the boundary.
+ * - The locals are whatever the host put there, so a walker should follow the
+ *   host's convention. A call that stores its `__FILE__` and `__LINE__` is what
+ *   lets a trace name a C location between two vm frames.
+ * - `resume_ip` is what lets a trace carry on past the boundary. It is a bundle
+ *   address, so a trace names a bundle rather than an opcode, the same
+ *   granularity `creator` gives for a word's frame. For a call the vm made from
+ *   an `EXTCALL` it is the bundle after the call.
+ *   For one made from the debug hook it is the bundle the run had reached and
+ *   has yet to run.
  *
  * `UNWIND` has to stop there for the same reason: unwinding past a live host
  * call would strand the host's own frame and return into a vm that had been
