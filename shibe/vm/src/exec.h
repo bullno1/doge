@@ -306,10 +306,6 @@ shibe_host_call_end(
 		shibe_host_call_t call_ = \
 			shibe_host_call_begin(vm, (RESUME_IP), (CAN_SUSPEND)); \
 		shibe_status_t host_status_ = (CALL); \
-		/* The register file has to be back in `state` before RESUME_IP is read: \
-		 * for an EXTCALL that expression is `ip`, and what it should name is \
-		 * where the callback left the run, not where it started */ \
-		SHIBE_LOAD_STATE(vm, state); \
 		host_status_ = shibe_host_call_end( \
 			vm, &call_, host_status_, (ERROR), (ARG), (RESUME_IP) \
 		); \
@@ -918,7 +914,10 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 		// from being made a second time
 		SHIBE_HOST_CALL(
 			host->extcall(host, vm, index),
-			SHIBE_ERR_EXTCALL, index, state.ip, true
+			// `vm->state.ip` rather than `state.ip`, because SHIBE_HOST_CALL
+			// reads this twice and the register file is only written back to
+			// the vm in between.
+			SHIBE_ERR_EXTCALL, index, vm->state.ip, true
 		);
 
 		SHIBE_NEXT_BUNDLE();
