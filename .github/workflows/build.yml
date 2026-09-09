@@ -28,11 +28,17 @@ jobs:
         with:
           submodules: recursive
 
-      # cmake/linux.cmake asks for clang and links with mold
-      - name: Install toolchain
+      - name: Install mold
+        uses: rui314/setup-mold@v1
+
+      - name: Install clang
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang mold
+          sudo apt-get install -y clang
+          clang --version
+          # -fuse-ld=mold resolves through ld.mold, not mold, so check the name
+          # that actually matters and fail here rather than deep in a link
+          ld.mold --version
 
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
