@@ -323,6 +323,22 @@ shibe_asm_bind_label(shibe_asm_t* sasm, shibe_asm_label_t label) {
 	info->bound = true;
 }
 
+void
+shibe_asm_bind_value(shibe_asm_t* sasm, shibe_asm_label_t label, shibe_cell_t value) {
+	if (!shibe_asm_valid_label(sasm, label)) { return; }
+
+	shibe_asm_label_info_t* info = bseg_ref(sasm->labels, label.id - 1);
+	if (info->bound) {
+		// Bound twice: the second value would silently win
+		sasm->failed = true;
+		return;
+	}
+
+	// No alignment: unlike a code label this does not name a location
+	info->addr = value;
+	info->bound = true;
+}
+
 #define BSEG_REALLOC(ptr, size, ctx) shibe_asm_realloc(ptr, size, ctx)
 #define BSEG_IMPLEMENTATION
 #include <bseg.h>

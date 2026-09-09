@@ -1,30 +1,5 @@
-#include <shibe.h>
-
-#define SHIBE_REGION_BITS  3
-#define SHIBE_INDEX_BITS   29
-#define SHIBE_INDEX_MASK   ((1u << SHIBE_INDEX_BITS) - 1)
-#define SHIBE_ZERO ((shibe_cell_t){ 0 })
-
-#define BSEG_API static inline
-// The first 3 bits are used to address a region.
-// So the region-local has a 29 bit address space.
-// Number of doubling segments that fit in the 29-bit index space.
-// Segment 0 is 2^BSEG_SKIPPED_SEGMENTS elements, so:
-// BSEG_MAX_SEGMENTS = 29 - BSEG_SKIPPED_SEGMENTS
-#define BSEG_MAX_SEGMENTS 23
-#include <bseg.h>
-#define SHIBE_REGION_MAX_LEN (((size_t)1u << 29) - ((size_t)1u << 6))
-
-typedef bseg(shibe_cell_t) shibe_mem_seg_t;
-
-struct shibe_vm_s {
-	shibe_config_t config;
-	shibe_state_t state;
-
-	shibe_mem_seg_t regions[8];
-
-	void* snapshot;
-};
+#include "internal.h"
+#include <shibe/opcode.h>
 
 static shibe_host_t shibe_dummy_host = { 0 };
 
@@ -74,11 +49,6 @@ shibe_realloc(void* ptr, size_t size, shibe_vm_t* vm) {
 	} else {
 		return NULL;
 	}
-}
-
-static inline uint32_t
-shibe_mem_index(shibe_cell_t addr) {
-	return addr.u32 & SHIBE_INDEX_MASK;
 }
 
 shibe_vm_t*
@@ -139,6 +109,7 @@ shibe_reset(shibe_vm_t* vm) {
 	vm->state.ip =
 	vm->state.dsp =
 	vm->state.asp =
+	vm->state.fp =
 	vm->state.tp =
 	vm->state.tm = SHIBE_ZERO;
 
@@ -160,7 +131,7 @@ shibe_alloc(shibe_vm_t* vm, shibe_mem_region_t region, shibe_cell_t num_cells) {
 	size_t new_len = len + (size_t)num_cells.u32;
 	if (new_len <= SHIBE_REGION_MAX_LEN) {
 		bseg_resize(*mem_seg, new_len, vm);
-		return (shibe_cell_t){ .u32 = ((uint32_t)region << SHIBE_INDEX_BITS) | (uint32_t)len };
+		return shibe_mem_addr(region, (uint32_t)len);
 	} else {
 		shibe_panic(vm, &(shibe_panic_t){
 			.error = SHIBE_ERR_OOM,
@@ -302,6 +273,12 @@ shibe_inspect(shibe_vm_t* vm) {
 	return &vm->state;
 }
 
+static shibe_status_t
+shibe_execute_with_hook(shibe_vm_t* vm);
+
+static shibe_status_t
+shibe_execute_without_hook(shibe_vm_t* vm);
+
 shibe_status_t
 shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	if (shibe_panicked(vm)) {
@@ -315,8 +292,27 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 		return SHIBE_ERROR;
 	}
 
-	return SHIBE_ERROR;
+	vm->state.ip = addr;
+
+	// Creating 2 separate versions is the only way to have optimized opcode
+	// dispatch when no debug hook is attached
+	if (vm->config.host->debug == NULL) {
+		return shibe_execute_without_hook(vm);
+	} else {
+		return shibe_execute_with_hook(vm);
+	}
 }
+
+#define SHIBE_VM_EXECUTE shibe_execute_without_hook
+#define SHIBE_DEBUG_HOOK(host, vm, state, offset)
+#include "exec.h"
+
+#undef SHIBE_DEBUG_HOOK
+#undef SHIBE_VM_EXECUTE
+
+#define SHIBE_VM_EXECUTE shibe_execute_with_hook
+#define SHIBE_DEBUG_HOOK(host, vm, state, offset) host->debug(host, vm, state, offset)
+#include "exec.h"
 
 #define BSEG_REALLOC(ptr, size, ctx) shibe_realloc(ptr, size, ctx)
 #define BSEG_IMPLEMENTATION

@@ -142,4 +142,19 @@ shibe_asm_make_label(shibe_asm_t* sasm);
 void
 shibe_asm_bind_label(shibe_asm_t* sasm, shibe_asm_label_t label);
 
+/**
+ * Bind `label` to `value` rather than to an address
+ *
+ * A label is a deferred cell; this binds one that does not hold a code address.
+ * Use it for an operand that is only known after the code referring to it has
+ * been emitted, such as the slot count of the `ENTER` opening a `let` form.
+ *
+ * Unlike @ref shibe_asm_bind_label this does not align: nothing is being
+ * pointed at, so the open bundle keeps filling.
+ *
+ * A label must be bound exactly once, at or before @ref shibe_asm_end.
+ */
+void
+shibe_asm_bind_value(shibe_asm_t* sasm, shibe_asm_label_t label, shibe_cell_t value);
+
 #endif

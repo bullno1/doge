@@ -4,81 +4,184 @@
 #include <stddef.h>
 #include <shibe.h>
 
-#define SHIBE_OPCODE(X) \
-	/* TRAP at 0, NOP is intentional */ \
-	X(SHIBE_OP_TRAP) \
-	X(SHIBE_OP_NOP) \
-	/* Flow control */ \
-	X(SHIBE_OP_JMP) \
-	X(SHIBE_OP_JZ) \
-	X(SHIBE_OP_CALL) \
-	X(SHIBE_OP_CCALL) \
-	X(SHIBE_OP_RET) \
-	X(SHIBE_OP_HALT) \
-	/* Stack manipulation */ \
-	X(SHIBE_OP_LIT) \
-	X(SHIBE_OP_DUP) \
-	X(SHIBE_OP_DRP) \
-	X(SHIBE_OP_SWP) \
-	X(SHIBE_OP_ROT) \
-	X(SHIBE_OP_NIP) \
-	X(SHIBE_OP_OVR) \
-	/* Memory */ \
-	X(SHIBE_OP_FETCH) \
-	X(SHIBE_OP_STORE) \
-	X(SHIBE_OP_BFETCH) \
-	X(SHIBE_OP_BSTORE) \
-	X(SHIBE_OP_COPY) \
-	/* Integer arithmetic */ \
-	X(SHIBE_OP_ADD) \
-	X(SHIBE_OP_SUB) \
-	X(SHIBE_OP_MUL) \
-	X(SHIBE_OP_SDIV) \
-	X(SHIBE_OP_SREM) \
-	X(SHIBE_OP_UDIV) \
-	X(SHIBE_OP_UREM) \
-	X(SHIBE_OP_NEG) \
-	X(SHIBE_OP_EQ) \
-	X(SHIBE_OP_NEQ) \
-	X(SHIBE_OP_SLT) \
-	X(SHIBE_OP_SLE) \
-	X(SHIBE_OP_ULT) \
-	X(SHIBE_OP_ULE) \
-	/* Floating point arithmetic */ \
-	X(SHIBE_OP_FADD) \
-	X(SHIBE_OP_FSUB) \
-	X(SHIBE_OP_FMUL) \
-	X(SHIBE_OP_FDIV) \
-	X(SHIBE_OP_FMOD) \
-	X(SHIBE_OP_FNEG) \
-	X(SHIBE_OP_FEQ) \
-	X(SHIBE_OP_FNEQ) \
-	X(SHIBE_OP_FLT) \
-	X(SHIBE_OP_FLE) \
-	X(SHIBE_OP_NAN) \
-	/* Logic and Bit */ \
-	X(SHIBE_OP_AND) \
-	X(SHIBE_OP_OR) \
-	X(SHIBE_OP_XOR) \
-	X(SHIBE_OP_NOT) \
-	X(SHIBE_OP_SHL) \
-	X(SHIBE_OP_SHR) \
-	X(SHIBE_OP_SAR) \
-	/* Temp */ \
-	X(SHIBE_OP_TMOVE) \
-	X(SHIBE_OP_TSET) \
-	X(SHIBE_OP_TGET) \
-	X(SHIBE_OP_TMARK) \
-	/* Aux frame */ \
-	X(SHIBE_OP_ENTER) \
-	X(SHIBE_OP_LEAVE) \
-	X(SHIBE_OP_UNWIND) \
-	X(SHIBE_OP_AGET) \
-	X(SHIBE_OP_ASET) \
-	/* External call */ \
-	X(SHIBE_OP_EXTCALL) \
+// Flags describing how an opcode interacts with the bundle it sits in.
+// The assembler enforces them; the VM assumes them.
+#define SHIBE_OPCODE_FLAG_NONE        0
+// Consumes the operand cell that follows the bundle
+#define SHIBE_OPCODE_FLAG_IMM         (1u << 0)
+// Must occupy the last slot of its bundle, so that the cell after the bundle's
+// operands is the next instruction. Every opcode that transfers control or
+// suspends needs this, or there is no address to come back to. HALT carries it
+// so that no unreachable slot is emitted after it. TRAP does not, because the
+// assembler fills the leftover slots of a bundle with it.
+#define SHIBE_OPCODE_FLAG_ENDS_BUNDLE (1u << 1)
 
-#define SHIBE_ENUM(OPCODE) OPCODE,
+// Each entry is: name, group, flags, stack effect, description.
+//
+// The stack effect is informal. The VM is untyped and the annotations only say
+// how an opcode reads the cells it touches; type checking happens in the high
+// level language. The form is `before -- after`, with `;` separating the data
+// stack from the auxiliary stack and `..` standing for a variable number of
+// cells. An operand cell taken from the instruction stream is not part of the
+// effect - SHIBE_OPCODE_FLAG_IMM is what says the opcode has one.
+#define SHIBE_OPCODE(X) \
+	X(TRAP,     "Special", 0, "--", "Halt execution with SHIBE_ERR_TRAP") \
+	X(NOP,      "Special", 0, "--", "Do nothing") \
+	\
+	X(JMP,      "Flow control", SHIBE_OPCODE_FLAG_IMM | SHIBE_OPCODE_FLAG_ENDS_BUNDLE, "--", "Continue at the operand address") \
+	X(JZ,       "Flow control", SHIBE_OPCODE_FLAG_IMM | SHIBE_OPCODE_FLAG_ENDS_BUNDLE, "cond:u32 --", "Jump to the operand if `cond` value is 0") \
+	X(CALL,     "Flow control", SHIBE_OPCODE_FLAG_ENDS_BUNDLE                        , "target:u32 -- ; -- ip:u32", "Push the return address (`ip`) to the auxiliary stack, jump to `target` address") \
+	X(CCALL,    "Flow control", SHIBE_OPCODE_FLAG_ENDS_BUNDLE                        , "cond:u32 target:u32 -- ; -- ip:u32", "If `cond` is non-zero, push the return address and jump to `target` address. Regardless of `cond`, `target` is always consumed") \
+	X(RET,      "Flow control", SHIBE_OPCODE_FLAG_ENDS_BUNDLE                        , "-- ; return:u32 --", "Return to an address in the auxiliary stack") \
+	X(HALT,     "Flow control", SHIBE_OPCODE_FLAG_ENDS_BUNDLE                        , "--", "Halt execution and return to the host. Execution cannot be resumed") \
+	\
+	X(LIT,      "Stack manipulation", SHIBE_OPCODE_FLAG_IMM, "-- operand:cell", "Push the operand into the stack") \
+	X(DUP,      "Stack manipulation", 0,                     "x:cell -- x x", "Duplicate the top of the stack") \
+	X(DRP,      "Stack manipulation", 0,                     "x:cell --", "Drop the top value of the stack") \
+	X(SWP,      "Stack manipulation", 0,                     "a:cell b:cell -- b a", "Swap the top 2 values of the stack") \
+	X(ROT,      "Stack manipulation", 0,                     "a:cell b:cell c:cell -- b c a", "Rotate the top 3 values of the stack, bringing the third value to the top") \
+	X(NIP,      "Stack manipulation", 0,                     "a:cell b:cell -- b", "Drop the second to top value of the stack") \
+	X(OVR,      "Stack manipulation", 0,                     "a:cell b:cell -- a b a", "Duplicate the second to top value of the stack") \
+	\
+	X(FETCH,    "Memory", 0, "addr:u32 -- value:cell", "Load a cell at address `addr`") \
+	X(STORE,    "Memory", 0, "value:cell addr:u32 --", "Store `value` at address `addr`") \
+	X(BFETCH,   "Memory", 0, "addr:u32 offset:u32 -- value:byte", "Load a byte at address `addr` and offset `offset` within the cell. `offset` is masked to [0, 3] (`offset & 3`).") \
+	X(BSTORE,   "Memory", 0, "value:byte addr:u32 offset:u32 --", "Store `value` at address `addr` and offset `offset` within the cell. `offset` is masked to [0, 3] (`offset & 3`) and `value` is masked to [0, 255] (`value & 0xff`).") \
+	X(COPY,     "Memory", 0, "dst:u32 src:u32 len:u32 --", "Bulk copy `len` cells from `src` to `dst`. This is similar to `memmove` in C but works at cell granularity.") \
+	\
+	X(ADD,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs+rhs:u32", "Integer addition") \
+	X(SUB,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs-rhs:u32", "Integer subtraction") \
+	X(MUL,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs*rhs:u32", "Integer multiplication") \
+	X(SDIV,     "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs/rhs:i32", "Signed integer division") \
+	X(SREM,     "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs%rhs:i32", "Signed integer remainder") \
+	X(UDIV,     "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs/rhs:u32", "Unsigned integer division") \
+	X(UREM,     "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs%rhs:u32", "Unsigned integer remainder") \
+	X(NEG,      "Integer arithmetic", 0, "num:i32 -- -num:i32", "Integer negation") \
+	X(EQ,       "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs==rhs:u32", "Integer equality test") \
+	X(NEQ,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs!=rhs:u32", "Integer inequality test") \
+	X(SLT,      "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs<rhs:u32", "Signed integer less than") \
+	X(SLE,      "Integer arithmetic", 0, "lhs:i32 rhs:i32 -- lhs<=rhs:u32", "Signed integer less than or equal") \
+	X(ULT,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs<rhs:u32", "Unsigned integer less than") \
+	X(ULE,      "Integer arithmetic", 0, "lhs:u32 rhs:u32 -- lhs<=rhs:u32", "Unsigned integer less than or equal") \
+	\
+	X(FADD,     "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs+rhs:f32", "Floating point addition") \
+	X(FSUB,     "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs-rhs:f32", "Floating point subtraction") \
+	X(FMUL,     "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs*rhs:f32", "Floating point multiplication") \
+	X(FDIV,     "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs/rhs:f32", "Floating point division") \
+	X(FMOD,     "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs%rhs:f32", "Floating point remainder") \
+	X(FNEG,     "Floating point arithmetic", 0, "num:f32 -- -num:f32", "Floating point negation") \
+	X(FEQ,      "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs==rhs:u32", "Floating point equality test") \
+	X(FNEQ,     "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs!=rhs:u32", "Floating point inequality test") \
+	X(FLT,      "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs<rhs:u32", "Floating point less than") \
+	X(FLE,      "Floating point arithmetic", 0, "lhs:f32 rhs:f32 -- lhs<=rhs:u32", "Floating point less than or equal") \
+	X(FNAN,     "Floating point arithmetic", 0, "value:f32 -- nan?:u32", "Check whether a value is NaN") \
+	\
+	X(AND,      "Bitwise manipulation", 0, "lhs:u32 rhs:u32 -- lhs&rhs:u32", "Bitwise and") \
+	X(OR,       "Bitwise manipulation", 0, "lhs:u32 rhs:u32 -- lhs|rhs:u32", "Bitwise or") \
+	X(XOR,      "Bitwise manipulation", 0, "lhs:u32 rhs:u32 -- lhs^rhs:u32", "Bitwise xor") \
+	X(NOT,      "Bitwise manipulation", 0, "num:u32 -- ~num:u32", "Bitwise not") \
+	X(SHL,      "Bitwise manipulation", 0, "num:u32 amount:u32 -- num<<amount:u32", "Bit-shift left") \
+	X(SHR,      "Bitwise manipulation", 0, "num:u32 amount:u32 -- num>>amount:u32", "Logical shift right (no sign extend)") \
+	X(SAR,      "Bitwise manipulation", 0, "num:i32 amount:u32 -- num>>amount:i32", "Arithmetic shift right (sign extend)") \
+	\
+	X(TMOVE,    "Temporary register", 0, "amount:i32 --", "Move the temporary register by the amount (vm.tp += amount)") \
+	X(TSET,     "Temporary register", 0, "temp:u32 --", "Set the temporary register (vm.tp = temp)") \
+	X(TGET,     "Temporary register", 0, "-- temp:u32", "Get the temporary register (temp = vm.tp)") \
+	X(TMARK,    "Temporary register", 0, "value:u32 --", "Move the temporary mark **forward** to the given value (if (value > vm.tm) vm.tm = value)") \
+	\
+	X(ENTER,    "Aux frame", SHIBE_OPCODE_FLAG_IMM, "-- ; -- ..frame:aux-frame", "Allocate an auxiliary frame with N general purpose slots where N is the operand's value (vm.fp = vm.asp + header_size; vm.asp += header_size + imm; vm.tm = vm.tp)") \
+	X(LEAVE,    "Aux frame", 0                    , "-- ; ..frame:aux-frame --", "Deallocate the auxiliary frame, restoring states, excluding the data stack") \
+	X(UNWIND,   "Aux frame", 0                    , "..x -- ; ..frame:aux-frame --", "Deallocate the auxiliary frame, restoring states, including the data stack") \
+	X(AGET,     "Aux frame", SHIBE_OPCODE_FLAG_IMM, "-- value:cell", "Retrieve a value from an auxiliary slot. The operand is a signed index: 0 and up reach the general purpose slots, negative values reach the frame header") \
+	X(ASET,     "Aux frame", SHIBE_OPCODE_FLAG_IMM, "value:cell --", "Store a value into an auxiliary slot. The operand must be a non-negative index, the frame header is read only") \
+	X(EXTCALL,  "External call", SHIBE_OPCODE_FLAG_IMM | SHIBE_OPCODE_FLAG_ENDS_BUNDLE, "..a -- ..b", "Make a call to the host with the call number in the operand. The stack effect is unknown. The signature is usually predeclared and the host must take great care to not break the contract.") \
+
+/*
+ * # Auxiliary frame and temporary pointer
+ *
+ * These are the general purpose building block for many higher level features.
+ *
+ * ## Auxiliary frame
+ *
+ * `ENTER n` creates an auxiliary frame with the following structure:
+ *
+ * - saved_dsp: Set to the current value of `dsp` (data stack pointer)
+ * - saved_fp: Set to the current value of `fp` (frame pointer)
+ * - saved_tm: Set to the current value of `tm` (temporary mark)
+ * - creator: Set to the address of this `ENTER`'s operand cell
+ * - n slots: General purpose slot tail
+ *
+ * `fp` will now point at the tail of the frame (at general purpose slot 0).
+ * `asp` is incremented by the size of this frame which is: n+4.
+ * `tm` is then set to `tp` so the frame starts with an empty temporary arena.
+ * `tm <= tp` therefore holds at all times.
+ *
+ * `creator` is never restored, it exists for stack walking. It names the code
+ * that built the frame, and `n` can be read back from it with a single `FETCH`,
+ * which is what lets a walker tell a frame's slots apart from the return
+ * addresses `CALL` pushes above them. Without it the two are indistinguishable.
+ *
+ * `LEAVE` removes the current auxiliary frame:
+ *
+ * - `asp = fp - 4` (the header sits directly below `fp`)
+ * - `fp = saved_fp`
+ * - `tp = tm`
+ * - `tm = saved_tm`
+ *
+ * Take note: `dsp` is **NOT** restored on purpose.
+ *
+ * `UNWIND` works the same way as `LEAVE` but with the following addition:
+ *
+ * * `dsp = saved_dsp`
+ *
+ * The data slots can be accessed with `AGET n` and `ASET n`.
+ * `AGET` takes a signed index, so a frame can read its own header:
+ *
+ * - `AGET -1`: creator
+ * - `AGET -2`: saved_tm
+ * - `AGET -3`: saved_fp
+ * - `AGET -4`: saved_dsp
+ *
+ * `ASET`, on the other hand, rejects a negative index.
+ *
+ * Using the auxiliary frames, several features can be built:
+ *
+ * - Local variables: Allocate a frame, store local variables inside general purpose slots.
+ *   On `LEAVE`, the variables are removed.
+ *   This can be used as temporary storage to help with stack shuffling and reduce shuffling noise.
+ * - Exception handling: `UNWIND` until a "catch" frame is encountered, undoing all the stack effects.
+ *   A frame type could, by convention, be stored in the first data slot (0).
+ *   `UNWIND` restores the data stack to exactly what it was when `ENTER` ran, so
+ *   anything pushed before `ENTER` survives it.
+ *   A `[ risky ] [ handler ] catch` form pushes the handler, then `ENTER`s, and
+ *   finds the handler back on top of the stack after the final `UNWIND`.
+ *   The error record has to live in memory: it is produced inside the frame being
+ *   unwound, so the data stack cannot carry it out.
+ *   The outermost frame is expected to be a catch frame installed by the runtime.
+ *   The VM does not check for one; unwinding past the last frame simply faults.
+ *
+ * ## Temporary pointer
+ *
+ * The VM provides a couple of pointers `tp` (temporary pointer) and `tm` (temporary mark).
+ * `tp` can be freely modified.
+ * `tp` is restored to `tm` on every `LEAVE` or `UNWIND`.
+ *
+ * On their own, the VM does not give any special meaning to these pointers.
+ * However, they are usually used to build call-scoped arena:
+ *
+ * - With each allocation, bump `tp` and allocate memory in a region accordingly.
+ * - Upon return from a function `tp` is reset to `tm`, making all temporarily allocated memories available for reuse.
+ *
+ * To return a variable sized structure to the caller, there are two options:
+ *
+ * - The caller allocates a large enough buffer for the callee to write over.
+ * - The callee uses `TMARK` to move `tm` over an allocated structure.
+ *   It will not be rolled over upon return.
+ *   A high level language would expose something along the line of `retain var`
+ *   where `var` points to an arena-allocated object.
+ */
+
+#define SHIBE_ENUM(NAME, GROUP, FLAGS, EFFECT, DESC) SHIBE_OP_ ## NAME,
 
 typedef enum : uint8_t {
 	SHIBE_OPCODE(SHIBE_ENUM)
@@ -86,12 +189,52 @@ typedef enum : uint8_t {
 
 _Static_assert(sizeof(shibe_opcode_t) == 1, "An opcode must fit in a byte to be bundled");
 
-#define SHIBE_OPCODE_TO_STR(OPCODE) case OPCODE: return &(#OPCODE[sizeof("SHIBE_OP_") - 1]);
+#define SHIBE_OPCODE_TO_STR(NAME, GROUP, FLAGS, EFFECT, DESC) case SHIBE_OP_ ## NAME: return #NAME;
 
 static inline const char*
 shibe_opcode_to_str(shibe_opcode_t opcode) {
 	switch (opcode) {
 		SHIBE_OPCODE(SHIBE_OPCODE_TO_STR)
+		default: return NULL;
+	}
+}
+
+#define SHIBE_OPCODE_TO_FLAGS(NAME, GROUP, FLAGS, EFFECT, DESC) case SHIBE_OP_ ## NAME: return (FLAGS);
+
+static inline uint32_t
+shibe_opcode_flags(shibe_opcode_t opcode) {
+	switch (opcode) {
+		SHIBE_OPCODE(SHIBE_OPCODE_TO_FLAGS)
+		default: return SHIBE_OPCODE_FLAG_NONE;
+	}
+}
+
+#define SHIBE_OPCODE_TO_GROUP(NAME, GROUP, FLAGS, EFFECT, DESC) case SHIBE_OP_ ## NAME: return GROUP;
+
+static inline const char*
+shibe_opcode_group(shibe_opcode_t opcode) {
+	switch (opcode) {
+		SHIBE_OPCODE(SHIBE_OPCODE_TO_GROUP)
+		default: return NULL;
+	}
+}
+
+#define SHIBE_OPCODE_TO_EFFECT(NAME, GROUP, FLAGS, EFFECT, DESC) case SHIBE_OP_ ## NAME: return EFFECT;
+
+static inline const char*
+shibe_opcode_effect(shibe_opcode_t opcode) {
+	switch (opcode) {
+		SHIBE_OPCODE(SHIBE_OPCODE_TO_EFFECT)
+		default: return NULL;
+	}
+}
+
+#define SHIBE_OPCODE_TO_DESC(NAME, GROUP, FLAGS, EFFECT, DESC) case SHIBE_OP_ ## NAME: return DESC;
+
+static inline const char*
+shibe_opcode_desc(shibe_opcode_t opcode) {
+	switch (opcode) {
+		SHIBE_OPCODE(SHIBE_OPCODE_TO_DESC)
 		default: return NULL;
 	}
 }

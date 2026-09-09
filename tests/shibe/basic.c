@@ -86,7 +86,7 @@ BTEST(basic, memory_out_of_bound) {
 	clear_panic();
 
 	// An untouched region has no valid address at all
-	shibe_cell_t unmapped = { .u32 = SHIBE_MEM_REGION_7 << 29 };
+	shibe_cell_t unmapped = shibe_mem_addr(SHIBE_MEM_REGION_7, 0);
 	shibe_fetch(vm, unmapped);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_MEM_FAULT);

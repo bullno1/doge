@@ -89,7 +89,7 @@ BTEST(str, copy_truncates) {
 
 BTEST(str, bad_address) {
 	// Reading a string outside of any allocation faults instead of returning junk
-	shibe_cell_t unmapped = { .u32 = SHIBE_MEM_REGION_7 << 29 };
+	shibe_cell_t unmapped = shibe_mem_addr(SHIBE_MEM_REGION_7, 0);
 	BTEST_EXPECT_EQUAL("%u", shibe_str_len(vm, unmapped), 0u);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_MEM_FAULT);

@@ -179,6 +179,52 @@ BTEST(sasm, unbound_label_writes_nothing) {
 	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 }
 
+BTEST(sasm, deferred_value) {
+	shibe_cell_t code = alloc_code();
+	shibe_asm_t* a = shibe_asm_begin(vm, asm_allocator, code);
+	BTEST_ASSERT(a != NULL);
+
+	// How many slots a `let` form needs is only known once its body was read
+	shibe_asm_label_t num_slots = shibe_asm_make_label(a);
+	shibe_asm_emit_imm_label(a, SHIBE_OP_ENTER, num_slots);
+	shibe_asm_emit_imm(a, SHIBE_OP_ASET, (shibe_cell_t){ .u32 = 0 });
+
+	// Binding a value does not align, so the bundle keeps filling
+	shibe_asm_bind_value(a, num_slots, (shibe_cell_t){ .u32 = 1 });
+
+	shibe_asm_emit(a, SHIBE_OP_LEAVE);
+	shibe_asm_emit(a, SHIBE_OP_HALT);
+
+	BTEST_ASSERT(shibe_asm_end(a));
+
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 0).u32, bundle_of(
+		SHIBE_OP_ENTER, SHIBE_OP_ASET, SHIBE_OP_LEAVE, SHIBE_OP_HALT
+	).u32);
+	// The ENTER operand holds the count that was patched in, not an address
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 1).u32, 1u);
+	BTEST_EXPECT_EQUAL("%u", cell_at(code, 2).u32, 0u);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sasm, value_bound_twice_writes_nothing) {
+	shibe_cell_t code = alloc_code();
+	shibe_asm_t* a = shibe_asm_begin(vm, asm_allocator, code);
+	BTEST_ASSERT(a != NULL);
+
+	shibe_asm_label_t num_slots = shibe_asm_make_label(a);
+	shibe_asm_emit_imm_label(a, SHIBE_OP_ENTER, num_slots);
+	shibe_asm_bind_value(a, num_slots, (shibe_cell_t){ .u32 = 1 });
+	shibe_asm_bind_value(a, num_slots, (shibe_cell_t){ .u32 = 2 });
+
+	BTEST_EXPECT(!shibe_asm_end(a));
+
+	// The vm never saw any of it
+	for (uint32_t i = 0; i < CODE_LEN; ++i) {
+		BTEST_EXPECT_EQUAL("%u", cell_at(code, i).u32, 0u);
+	}
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
 BTEST(sasm, end_restores_the_allocator) {
 	// Room for more bundles than the first bseg segment holds
 	shibe_cell_t code = shibe_alloc(vm, SHIBE_MEM_REGION_3, (shibe_cell_t){ .u32 = 128 });

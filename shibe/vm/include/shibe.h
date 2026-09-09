@@ -50,6 +50,7 @@ typedef struct {
 	shibe_cell_t ip;
 	shibe_cell_t dsp;
 	shibe_cell_t asp;
+	shibe_cell_t fp;
 	shibe_cell_t tp;
 	shibe_cell_t tm;
 
@@ -60,7 +61,10 @@ typedef struct {
 	shibe_exec_state_t exec_state;
 } shibe_state_t;
 
-typedef enum {
+// The fixed underlying type keeps the enumeration constants unsigned. Without
+// it they are `int`, and shifting one into the region field of an address
+// (`SHIBE_MEM_REGION_7 << 29`) overflows and is undefined
+typedef enum : uint32_t {
 	SHIBE_MEM_REGION_0,
 	SHIBE_MEM_REGION_1,
 	SHIBE_MEM_REGION_2,
@@ -81,7 +85,7 @@ struct shibe_allocator_s {
 typedef struct shibe_host_s shibe_host_t;
 struct shibe_host_s {
 	void (*panic)(shibe_host_t* host, shibe_vm_t* vm, const shibe_panic_t* panic);
-	shibe_status_t (*debug)(shibe_host_t* host, shibe_vm_t* vm, const shibe_state_t* state);
+	shibe_status_t (*debug)(shibe_host_t* host, shibe_vm_t* vm, const shibe_state_t* state, uint32_t bundle_offset);
 	shibe_status_t (*extcall)(shibe_host_t* host, shibe_vm_t* vm, shibe_cell_t index);
 };
 
@@ -135,9 +139,32 @@ shibe_resume(shibe_vm_t* vm);
 SHIBE_API const shibe_state_t*
 shibe_inspect(shibe_vm_t* vm);
 
+// An address packs the region into the top bits and a cell index into the rest,
+// which is what limits a region to 2^SHIBE_MEM_INDEX_BITS cells
+#define SHIBE_MEM_REGION_BITS 3
+#define SHIBE_MEM_INDEX_BITS  29
+#define SHIBE_MEM_REGION_MASK (((uint32_t)1 << SHIBE_MEM_REGION_BITS) - 1)
+#define SHIBE_MEM_INDEX_MASK  (((uint32_t)1 << SHIBE_MEM_INDEX_BITS) - 1)
+
 static inline shibe_mem_region_t
 shibe_mem_region(shibe_cell_t addr) {
-	return (shibe_mem_region_t)(addr.u32 >> 29);
+	return (shibe_mem_region_t)(addr.u32 >> SHIBE_MEM_INDEX_BITS);
+}
+
+static inline uint32_t
+shibe_mem_index(shibe_cell_t addr) {
+	return addr.u32 & SHIBE_MEM_INDEX_MASK;
+}
+
+// Build an address out of a region and a cell index.
+// Both halves are masked, so an index running off the end of a region wraps
+// inside it instead of silently landing in the next one.
+static inline shibe_cell_t
+shibe_mem_addr(shibe_mem_region_t region, uint32_t index) {
+	return (shibe_cell_t){
+		.u32 = (((uint32_t)region & SHIBE_MEM_REGION_MASK) << SHIBE_MEM_INDEX_BITS)
+			| (index & SHIBE_MEM_INDEX_MASK)
+	};
 }
 
 #endif
