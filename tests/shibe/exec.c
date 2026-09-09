@@ -62,6 +62,30 @@ suspending_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
 	return SHIBE_SUSPENDED;
 }
 
+// Suspends on every single opcode, so a resume that reported the opcode it
+// picks up on all over again would never get anywhere
+static shibe_status_t
+single_stepping_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
+	(void)host; (void)hooked; (void)state;
+	if (num_steps < MAX_STEPS) { steps[num_steps] = at; }
+	++num_steps;
+	return SHIBE_SUSPENDED;
+}
+
+// Suspends on one nominated opcode, named by where it sits rather than by a
+// step count so that it can pick one out of a nested run
+static shibe_op_addr_t suspend_at;
+
+static shibe_status_t
+suspending_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
+	(void)host; (void)hooked; (void)state;
+	if (num_steps < MAX_STEPS) { steps[num_steps] = at; }
+	++num_steps;
+	return at.bundle.u32 == suspend_at.bundle.u32 && at.slot == suspend_at.slot
+		? SHIBE_SUSPENDED
+		: SHIBE_OK;
+}
+
 static shibe_status_t
 failing_hook(shibe_host_t* host, shibe_vm_t* hooked, const shibe_state_t* state, shibe_op_addr_t at) {
 	(void)host; (void)hooked; (void)state; (void)at;
@@ -108,6 +132,22 @@ boundary_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
 		: inspecting_extcall(host, called, index);
 }
 
+// Call 1 re-enters, and the nested run it starts is the one that suspends
+static shibe_status_t
+nested_suspending_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	return index.u32 == 1
+		? reentrant_extcall(host, called, index)
+		: suspending_extcall(host, called, index);
+}
+
+// Re-enters, lets the nested run finish, then suspends the run it was called
+// from. That one is the outermost, so the suspension stands.
+static shibe_status_t
+reenter_then_suspend_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	shibe_status_t status = reentrant_extcall(host, called, index);
+	return status == SHIBE_OK ? SHIBE_SUSPENDED : status;
+}
+
 // Re-enters over and over without ever completing, to exhaust the aux stack
 static shibe_cell_t recursive_entry;
 
@@ -130,6 +170,8 @@ exec_init_per_test(void) {
 	observed_outer_ip = (shibe_cell_t){ 0 };
 	observed_saved_fp = (shibe_cell_t){ 0 };
 	last_extcall = (shibe_cell_t){ 0 };
+	// No real opcode sits at address 0, so nothing matches until a test says so
+	suspend_at = (shibe_op_addr_t){ 0 };
 
 	code = shibe_alloc(vm, SHIBE_MEM_REGION_1, (shibe_cell_t){ .u32 = CODE_LEN });
 	sasm = shibe_asm_begin(vm, exec_allocator, code);
@@ -562,6 +604,146 @@ BTEST(sexec, extcall_can_suspend) {
 	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_SUSPENDED);
 }
 
+BTEST(sexec, extcall_resumes_after_the_call) {
+	test_host.extcall = suspending_extcall;
+
+	// EXTCALL closes its bundle, so the work below it is in the next one
+	LIT(2);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 3 }));
+	LIT(5);
+	EMIT(ADD);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	// Everything the run had done is still there
+	BTEST_ASSERT_EQUAL("%u", depth(), 1u);
+
+	// What a handler that suspends to wait on something does when the answer
+	// turns up: leave the result behind, then let the run carry on
+	shibe_push(vm, (shibe_cell_t){ .i32 = 10 });
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	// The call is not made a second time
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 1);
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 17);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_IDLE);
+}
+
+BTEST(sexec, debug_hook_can_suspend_mid_bundle) {
+	test_host.debug = suspending_hook;
+
+	// One bundle of four opcodes, so the suspension lands in the middle of a
+	// window that the resume has to pick up where it was left
+	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 2 };
+	LIT(1);
+	LIT(2);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%d", num_steps, 3);
+	// The hook reports an opcode before it runs, so the ADD has not happened
+	BTEST_EXPECT_EQUAL("%u", depth(), 2u);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	// The ADD ran without being reported again, and the HALT after it was
+	BTEST_EXPECT_EQUAL("%d", num_steps, 4);
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sexec, a_hook_that_always_suspends_single_steps) {
+	test_host.debug = single_stepping_hook;
+
+	shibe_cell_t bundle = shibe_asm_here(sasm);
+	LIT(1);
+	LIT(2);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+
+	// Four opcodes, so four suspensions and one resume that reaches the HALT.
+	// The bound is what fails the test if a resume ever stands still.
+	int num_resumes = 0;
+	shibe_status_t status;
+	while ((status = shibe_resume(vm)) == SHIBE_SUSPENDED && num_resumes < MAX_STEPS) {
+		++num_resumes;
+	}
+	BTEST_EXPECT_EQUAL("%d", status, SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_resumes, 3);
+
+	// Every opcode was reported exactly once, in order
+	BTEST_ASSERT_EQUAL("%d", num_steps, 4);
+	for (uint8_t i = 0; i < 4; ++i) {
+		BTEST_EXPECT_EQUAL("%u", steps[i].bundle.u32, bundle.u32);
+		BTEST_EXPECT_EQUAL("%u", (unsigned)steps[i].slot, (unsigned)i);
+	}
+
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sexec, the_hook_can_be_dropped_while_suspended) {
+	test_host.debug = suspending_hook;
+
+	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 2 };
+	LIT(1);
+	LIT(2);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_ASSERT_EQUAL("%d", num_steps, 3);
+
+	// The two interpreter builds have to agree about where a suspended run is:
+	// this one is picked up by the one without a hook
+	test_host.debug = NULL;
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_steps, 3);
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+}
+
+BTEST(sexec, resume_without_a_suspension_is_rejected) {
+	LIT(1);
+	EMIT(HALT);
+
+	// Idle: there is no activation to come back to
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	clear_panic();
+
+	// And a run that halted is over for good
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+}
+
+BTEST(sexec, resuming_a_panicked_vm_reports_nothing_new) {
+	test_host.extcall = failing_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 3 }));
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_ASSERT_EQUAL("%d", num_panics, 1);
+
+	// Same as shibe_execute: the panic already fired, so this only relays it
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+}
+
 BTEST(sexec, debug_hook_failure_panics) {
 	test_host.debug = failing_hook;
 
@@ -624,6 +806,102 @@ BTEST(sexec, re_entry_while_suspended_is_rejected) {
 	BTEST_EXPECT_EQUAL("%d", shibe_execute(vm, code), SHIBE_ERROR);
 	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+}
+
+BTEST(sexec, nested_extcall_suspension_is_rejected) {
+	test_host.extcall = nested_suspending_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	LIT(5);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	// A leaf extcall, but the run it belongs to was re-entered, and there is no
+	// way back into the host call frame underneath it
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT(RET);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 2);
+	// Raised once, at the boundary the suspension could not cross, and only
+	// relayed by the level above it
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
+	// Ends the nest like any other panic, boundary frame left to walk
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 6u);
+
+	// And there is nothing to come back to
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_ERROR);
+}
+
+BTEST(sexec, nested_hook_suspension_is_rejected) {
+	test_host.extcall = reentrant_extcall;
+	test_host.debug = suspending_hook;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	// The hook is the other way to suspend, and it is refused in a nested run
+	// for the same reason, wherever inside a bundle it stops
+	shibe_asm_bind_label(sasm, sub);
+	suspend_at = (shibe_op_addr_t){ .bundle = shibe_asm_here(sasm), .slot = 1 };
+	LIT(7);
+	EMIT(DUP);
+	EMIT(ADD);
+	EMIT(RET);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_PANIC);
+}
+
+BTEST(sexec, re_entry_then_suspension_resumes_the_outer_run) {
+	test_host.extcall = reenter_then_suspend_extcall;
+
+	// What matters is which run suspends, not whether the callback had re-entered
+	// the vm before it did: the nested run is over by then
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	LIT(5);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	LIT(7);
+	EMIT(RET);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	// The nested run handed its activation back before the suspension
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 12);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
 }
 
 BTEST(sexec, re_entry_leaves_a_walkable_boundary) {

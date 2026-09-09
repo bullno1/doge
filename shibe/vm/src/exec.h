@@ -142,7 +142,12 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 //
 // A vm that is already panicked wins over whatever the callback returned: a
 // callback that panics the vm and then reports SHIBE_OK is still a stop.
-#define SHIBE_HOST_RESULT(STATUS, ERROR, ARG) \
+//
+// A suspension has no such second reading. Only a run the host started from the
+// outside may suspend: shibe_execute turns a nested one into a panic, which
+// arrives above as a panicked vm. Therefore, a suspension here is always this
+// run's own, and `RESUME_WIN` is where it comes back to.
+#define SHIBE_HOST_RESULT(STATUS, ERROR, ARG, RESUME_WIN) \
 	do { \
 		shibe_status_t host_status_ = (STATUS); \
 		if (shibe_panicked(vm)) { \
@@ -151,6 +156,8 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 		} \
 		if (host_status_ == SHIBE_ERROR) { SHIBE_FAULT((ERROR), (ARG)); } \
 		if (host_status_ == SHIBE_SUSPENDED) { \
+			vm->suspension.win = (RESUME_WIN); \
+			SHIBE_TRACE_SAVE(); \
 			SHIBE_SAVE_STATE(vm, state); \
 			vm->state.exec_state = SHIBE_EXEC_SUSPENDED; \
 			return SHIBE_SUSPENDED; \
@@ -223,7 +230,6 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 // Switch {{{
 
 #define SHIBE_BEGIN_DISPATCH() \
-	win = SHIBE_OP_ENDB; \
 	for (;;) { \
 		uint8_t opcode = (uint8_t)win; win >>= 8; \
 		SHIBE_TRACE_STEP(); \
@@ -247,7 +253,6 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 		SHIBE_OPCODE(SHIBE_DISPATCH_ENTRY) \
 		[SHIBE_OP_ENDB] = &&shibe_op_ENDB, \
 	}; \
-	win = SHIBE_OP_ENDB; \
 	SHIBE_NEXT(); \
 	shibe_op_ENDB: SHIBE_NEXT_BUNDLE();
 #define SHIBE_OP(NAME)          shibe_op_ ## NAME:
@@ -267,7 +272,6 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 #define SHIBE_DISPATCH_ENTRY(NAME, GROUP, FLAGS, EFFECT, DESC) \
 	case SHIBE_OP_ ## NAME: goto shibe_op_ ## NAME;
 #define SHIBE_BEGIN_DISPATCH() \
-	win = SHIBE_OP_ENDB; \
 	SHIBE_NEXT(); \
 	shibe_op_ENDB: SHIBE_NEXT_BUNDLE();
 #define SHIBE_OP(NAME)          shibe_op_ ## NAME:
@@ -369,26 +373,46 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 #undef SHIBE_TRACE_DECL
 #undef SHIBE_TRACE_REFILL
 #undef SHIBE_TRACE_STEP
+#undef SHIBE_TRACE_SAVE
 
 #if SHIBE_HAS_HOOK
-#	define SHIBE_TRACE_DECL()   shibe_op_addr_t at = { 0 };
+// `armed` is what keeps a resume from reporting the opcode it picks up on. The
+// hook already saw that one, right before it asked for the suspension; showing
+// it again would leave a hook that always suspends spinning on the spot instead
+// of single stepping. The first dispatch of a resumed run disarms it, whatever
+// it is: for an EXTCALL suspension that is the pseudo opcode standing in for
+// the refill, which is not reported anyway.
+#	define SHIBE_TRACE_DECL() \
+		shibe_op_addr_t at = resuming ? vm->suspension.at : (shibe_op_addr_t){ 0 }; \
+		bool armed = !resuming
 #	define SHIBE_TRACE_REFILL() do { at.bundle = state.ip; at.slot = 0xff; } while (0)
 // The window bootstraps on a synthetic SHIBE_OP_ENDB, and every bundle ends on
 // one. Neither is an instruction, so neither is reported.
 #	define SHIBE_TRACE_STEP() \
 		do { \
-			if (opcode != SHIBE_OP_ENDB) { \
+			if (!armed) { \
+				armed = true; \
+			} else if (opcode != SHIBE_OP_ENDB) { \
 				at.slot += 1; \
 				SHIBE_SAVE_STATE(vm, state); \
 				shibe_status_t hook_ = host->debug(host, vm, &vm->state, at); \
 				SHIBE_LOAD_STATE(vm, state); \
-				SHIBE_HOST_RESULT(hook_, SHIBE_ERR_HOOK, SHIBE_ZERO); \
+				/* The opcode has not run yet, so the window it came out of is \
+				 * where a resume has to start */ \
+				SHIBE_HOST_RESULT( \
+					hook_, SHIBE_ERR_HOOK, SHIBE_ZERO, (win << 8) | opcode \
+				); \
 			} \
 		} while (0)
+#	define SHIBE_TRACE_SAVE() do { vm->suspension.at = at; } while (0)
 #else
 #	define SHIBE_TRACE_DECL()
 #	define SHIBE_TRACE_REFILL()
 #	define SHIBE_TRACE_STEP()
+// Without a hook there is no trace position to keep. The record is left alone
+// rather than cleared: a run that suspends here always resumes into a refill,
+// which writes a fresh one before the hook of a later run could read it.
+#	define SHIBE_TRACE_SAVE()
 #endif
 
 #if SHIBE_RELAX_DIAGNOSTICS
@@ -402,8 +426,11 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 #	endif
 #endif
 
+// `resuming` picks up a run a host callback suspended instead of starting one:
+// `ip` and the rest of the register file are already where that run left them,
+// and the decode window comes back out of the suspension record.
 static shibe_status_t
-SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
+SHIBE_VM_EXECUTE(shibe_vm_t* vm, bool resuming) {
 	shibe_host_t* host = vm->config.host;
 	uint32_t ds_len = vm->config.ds_len;
 	uint32_t as_len = vm->config.as_len;
@@ -413,8 +440,10 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 	SHIBE_LOAD_STATE(vm, state);
 
 	// The opcodes of the current bundle, lowest slot first, with the pseudo
-	// opcode above them. Every dispatch shifts one byte out.
-	uint64_t win;
+	// opcode above them. Every dispatch shifts one byte out. A fresh run
+	// bootstraps on the pseudo opcode alone, so its first dispatch refills from
+	// `ip`.
+	uint64_t win = resuming ? vm->suspension.win : SHIBE_OP_ENDB;
 	SHIBE_TRACE_DECL();
 
 	SHIBE_BEGIN_DISPATCH()
@@ -720,7 +749,11 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 		SHIBE_SAVE_STATE(vm, state);
 		shibe_status_t status = host->extcall(host, vm, index);
 		SHIBE_LOAD_STATE(vm, state);
-		SHIBE_HOST_RESULT(status, SHIBE_ERR_EXTCALL, index);
+		// Nothing may follow an EXTCALL in its bundle and `ip` is already past
+		// the operand cell, so a resume has nothing left to dispatch: it starts
+		// on the pseudo opcode and refills, which is also what keeps the call
+		// from being made a second time
+		SHIBE_HOST_RESULT(status, SHIBE_ERR_EXTCALL, index, SHIBE_OP_ENDB);
 
 		SHIBE_NEXT_BUNDLE();
 	}

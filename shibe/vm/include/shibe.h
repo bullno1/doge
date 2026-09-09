@@ -170,12 +170,36 @@ shibe_pop(shibe_vm_t* vm);
  * A stub that does not hand the auxiliary stack back as it found it panics with
  * SHIBE_ERR_INVALID rather than corrupting the outer run.
  *
- * A panic or a suspension inside a nested run ends the whole nest. The boundary
- * frame is left in place so the host can still walk the stack afterwards.
+ * A panic inside a nested run ends the whole chain. The boundary frame is left
+ * in place so the host can still walk the stack afterwards.
+ *
+ * A nested run may not suspend. It runs underneath a host call frame that is
+ * gone by the time a resume could happen.
+ * Any attempt to make a nested suspension by returning `SHIBE_SUSPENDED` from
+ * a nested callback would result in a panic with `SHIBE_ERR_INVALID`.
  */
 SHIBE_API shibe_status_t
 shibe_execute(shibe_vm_t* vm, shibe_cell_t addr);
 
+/**
+ * Continue an execution that a host callback suspended
+ *
+ * A run suspends when the extcall handler or the debug hook returns
+ * SHIBE_SUSPENDED. The host is free to work on the vm in between.
+ * Then, it could push a result and resume execution, turning an asynchronous
+ * call into a synchronous blocking call for the VM.
+ *
+ * Where the run picks up depends on which callback stopped it:
+ *
+ * - An extcall carries on after the call. It is not made a second time, so a
+ *   handler that suspends runs its side of the call exactly once.
+ * - The debug hook carries on at the instruction it was reporting, which had
+ *   not run yet, and that instruction is not reported again. A hook that always
+ *   suspends therefore single steps rather than standing still.
+ *
+ * Anything other than a suspended vm panics with SHIBE_ERR_INVALID.
+ * A panicked vm returns SHIBE_ERROR without panicking again, like shibe_execute.
+ */
 SHIBE_API shibe_status_t
 shibe_resume(shibe_vm_t* vm);
 

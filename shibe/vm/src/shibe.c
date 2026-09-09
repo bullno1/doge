@@ -114,6 +114,8 @@ shibe_reset(shibe_vm_t* vm) {
 	vm->state.tm = SHIBE_ZERO;
 
 	vm->state.exec_state = SHIBE_EXEC_IDLE;
+	// The activation it belonged to is gone, so there is nothing to come back to
+	vm->suspension = (shibe_suspension_t){ 0 };
 }
 
 shibe_cell_t
@@ -274,10 +276,24 @@ shibe_inspect(shibe_vm_t* vm) {
 }
 
 static shibe_status_t
-shibe_execute_with_hook(shibe_vm_t* vm);
+shibe_execute_with_hook(shibe_vm_t* vm, bool resuming);
 
 static shibe_status_t
-shibe_execute_without_hook(shibe_vm_t* vm);
+shibe_execute_without_hook(shibe_vm_t* vm, bool resuming);
+
+// Creating 2 separate versions is the only way to have optimized opcode
+// dispatch when no debug hook is attached. Which one runs is decided per run,
+// so a hook may be attached or dropped while a run is suspended: what carries
+// across is the suspension record, which both variants read and write the same
+// way.
+static inline shibe_status_t
+shibe_run(shibe_vm_t* vm, bool resuming) {
+	if (vm->config.host->debug == NULL) {
+		return shibe_execute_without_hook(vm, resuming);
+	} else {
+		return shibe_execute_with_hook(vm, resuming);
+	}
+}
 
 shibe_status_t
 shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
@@ -331,19 +347,25 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	vm->state.ip = addr;
 	vm->state.exec_state = SHIBE_EXEC_RUNNING;
 
-	// Creating 2 separate versions is the only way to have optimized opcode
-	// dispatch when no debug hook is attached
-	shibe_status_t status;
-	if (vm->config.host->debug == NULL) {
-		status = shibe_execute_without_hook(vm);
-	} else {
-		status = shibe_execute_with_hook(vm);
+	shibe_status_t status = shibe_run(vm, false);
+
+	// A nested run has nowhere to come back to, so it is not allowed to
+	// suspend. It was started from inside a host callback, and that call frame
+	// is gone by the time a resume could happen: there is no way to hand
+	// control back to the host from the middle of a callback that has already
+	// returned, and the outer activation underneath it could never be picked up
+	// again. Turning it into a panic here is what keeps every suspension the
+	// host does see resumable.
+	if (nested && status == SHIBE_SUSPENDED) {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_INVALID,
+		});
+		return SHIBE_ERROR;
 	}
 
-	// Hand the outer run its activation back. A panic or a suspension is left
-	// where it stopped: it ends the whole nest, there is nowhere to record an
-	// outer activation for a resume to come back to, and leaving the boundary
-	// frame in place is what lets the host walk the stack afterwards.
+	// Hand the outer run its activation back. A panic is left where it stopped:
+	// it ends the whole nest, and leaving the boundary frame in place is what
+	// lets the host walk the stack afterwards.
 	if (nested && status == SHIBE_OK) {
 		// The entry point has to be a stub that halts, so it must give the
 		// auxiliary stack back exactly as it found it
@@ -362,6 +384,28 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	}
 
 	return status;
+}
+
+shibe_status_t
+shibe_resume(shibe_vm_t* vm) {
+	if (shibe_panicked(vm)) {
+		return SHIBE_ERROR;
+	}
+
+	// Only a suspended run has somewhere to come back to. An idle vm has no
+	// activation at all, and a running one is already inside the interpreter.
+	if (vm->state.exec_state != SHIBE_EXEC_SUSPENDED) {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_INVALID,
+		});
+		return SHIBE_ERROR;
+	}
+
+	// Whatever the host did to the vm in the meantime stands: the registers and
+	// both stacks are read back as they are now, which is how an extcall that
+	// suspended leaves its result behind.
+	vm->state.exec_state = SHIBE_EXEC_RUNNING;
+	return shibe_run(vm, true);
 }
 
 // The interpreter is compiled into this file, so exec.h must not stand in for
