@@ -5,6 +5,11 @@
 #include <bmacro.h>
 
 #define TEST_DS_LEN 256u
+// Small on purpose. The re-entrancy tests nest shibe_execute until this runs
+// out, and every level costs a host call frame on the way: left at the default
+// the auxiliary stack outlasts the host's own stack, which on wasm means v8
+// gives up first and the test dies instead of panicking.
+#define TEST_AS_LEN 64u
 
 static barena_pool_t arena_pool;
 static barena_t arena;
@@ -53,6 +58,7 @@ init_per_test(void) {
 	num_panics = 0;
 	vm = shibe_create((shibe_config_t){
 		.ds_len = TEST_DS_LEN,
+		.as_len = TEST_AS_LEN,
 		.allocator = shibe_barena_init(&shibe_allocator, &arena_pool),
 		.host = &test_host,
 	});
