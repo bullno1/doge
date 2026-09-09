@@ -13,7 +13,10 @@ fi
 
 BUILD_DIR="${BUILD_TYPE}-${SUFFIX}"
 
-. /etc/os-release || true
+if [ -r /etc/os-release ]
+then
+	. /etc/os-release
+fi
 
 mkdir -p .build/steamrt
 
@@ -44,6 +47,7 @@ then
 		-DPLATFORM_NAME="steamrt" \
 		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
 		-DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+		-DSHIBE_DISPATCH_METHOD="${SHIBE_DISPATCH_METHOD}" \
 		-DCMAKE_C_COMPILER_LAUNCHER=ccache \
 		-DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
 		.

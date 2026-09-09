@@ -1,16 +1,17 @@
 #!/bin/sh -e
 
 BUILD_TYPE=${BUILD_TYPE:-RelWithDebInfo}
-RELOADABLE=${RELOADABLE:-ON}
 
-if [ "${RELOADABLE}" = "ON" ]
+if [ -r /etc/os-release ]
 then
-	SUFFIX="reloadable"
-else
-	SUFFIX="static"
+	. /etc/os-release
 fi
 
-BUILD_DIR="${BUILD_TYPE}-${SUFFIX}"
-
-exec ~/.steam/steam/steamapps/common/SteamLinuxRuntime_4/run --share-pid -- \
-    bin/steamrt/${BUILD_DIR}/4rogues
+if [ "${ID}" = "steamrt" ]
+then
+	# Already inside the runtime, as in the sdk container or on ci
+	exec bin/steamrt/${BUILD_TYPE}/tests "$@"
+else
+	exec ~/.steam/steam/steamapps/common/SteamLinuxRuntime_4/run --share-pid -- \
+	    bin/steamrt/${BUILD_TYPE}/tests "$@"
+fi

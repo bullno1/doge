@@ -1,12 +1,12 @@
 #!/bin/sh -e
 
-cmd/linux/build || true
+cmd/steamrt/build || true
 
-inotifywait -r -e CLOSE_WRITE -m src deps | \
+inotifywait -r -e CLOSE_WRITE -m shibe tests deps | \
     while read path action file
 	do
 		clear
 		echo "Rebuilding"
-		cmd/linux/build || true
+		cmd/steamrt/build && cmd/steamrt/run || true
 		echo "Done"
     done

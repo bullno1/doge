@@ -8,7 +8,7 @@ cd .build/web > /dev/null
 
 if [ ! -f "${BUILD_DIR}/build.ninja" ]
 then
-	embuilder build libc sdl3
+	embuilder build libc
 	emcmake cmake \
 		-G "Ninja" \
 		-B ${BUILD_DIR} \
@@ -17,6 +17,7 @@ then
 		-DRELOADABLE=OFF \
 		-DPLATFORM_NAME="web" \
 		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+		-DSHIBE_DISPATCH_METHOD="${SHIBE_DISPATCH_METHOD}" \
 		-DCMAKE_C_COMPILER_LAUNCHER=ccache \
 		-DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
 		../../

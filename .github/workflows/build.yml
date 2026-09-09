@@ -1,0 +1,124 @@
+---
+name: Build
+run-name: Build
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+on:
+  - push
+jobs:
+  steamrt:
+    name: SteamRT (${{ matrix.build_type }}, ${{ matrix.dispatch.name }})
+    runs-on: ubuntu-latest
+    container:
+      image: registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, RelWithDebInfo]
+        dispatch:
+          - { id: 0, name: computed-goto }
+          - { id: 1, name: switched-goto }
+          - { id: 2, name: switch }
+    env:
+      BUILD_TYPE: ${{ matrix.build_type }}
+      SHIBE_DISPATCH_METHOD: ${{ matrix.dispatch.id }}
+      RELOADABLE: OFF
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          create-symlink: true
+          key: ccache-${{ github.job }}-${{ matrix.build_type }}-${{ matrix.dispatch.id }}
+          max-size: 500M
+
+      - name: Build
+        run: cmd/steamrt/build
+
+      - name: Test
+        run: cmd/steamrt/run
+
+  web:
+    name: Web (${{ matrix.build_type }}, ${{ matrix.dispatch.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, RelWithDebInfo]
+        dispatch:
+          - { id: 0, name: computed-goto }
+          - { id: 1, name: switched-goto }
+          - { id: 2, name: switch }
+    env:
+      EM_VERSION: 6.0.0
+      EM_CACHE_FOLDER: 'emsdk-cache'
+      BUILD_TYPE: ${{ matrix.build_type }}
+      SHIBE_DISPATCH_METHOD: ${{ matrix.dispatch.id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup emscripten
+        uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: ${{ env.EM_VERSION }}
+          actions-cache-folder: ${{ env.EM_CACHE_FOLDER }}
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          create-symlink: true
+          key: ccache-${{ github.job }}-${{ matrix.build_type }}-${{ matrix.dispatch.id }}
+          max-size: 500M
+
+      - name: Install CMake
+        uses: ssrobins/install-cmake@v1
+
+      - name: Build
+        run: cmd/web/build
+
+      - name: Test
+        run: cmd/web/run
+
+  win:
+    name: Windows (${{ matrix.build_type }}, ${{ matrix.dispatch.name }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, RelWithDebInfo]
+        dispatch:
+          - { id: 1, name: switched-goto }
+          - { id: 2, name: switch }
+    env:
+      BUILD_TYPE: ${{ matrix.build_type }}
+      SHIBE_DISPATCH_METHOD: ${{ matrix.dispatch.id }}
+      GENERATOR: "Ninja Multi-Config"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ github.job }}-${{ matrix.build_type }}-${{ matrix.dispatch.id }}
+          max-size: 500M
+          variant: sccache
+
+      - name: Install CMake
+        uses: ssrobins/install-cmake@v1
+
+      - name: Build
+        run: cmd/win/build.bat
+
+      - name: Test
+        run: cmd/win/run.bat
