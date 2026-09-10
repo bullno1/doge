@@ -705,6 +705,63 @@ BTEST(ssuspend, a_frame_opened_inside_a_bundle_cannot_be_resumed_through) {
 	BTEST_EXPECT(last_panic.error == SHIBE_ERR_NOT_SUSPENDABLE);
 }
 
+// Call 2 suspends on its own; call 6 is the second half of the hook's frame
+static shibe_status_t
+suspend_then_finish_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host; (void)called;
+	++num_extcalls;
+	return index.u32 == 6 ? SHIBE_OK : SHIBE_SUSPENDED;
+}
+
+BTEST(ssuspend, a_hook_relaying_a_nested_suspension_keeps_the_inner_stop) {
+	test_host.debug = framed_reentering_hook;
+	test_host.extcall = suspend_then_finish_extcall;
+
+	// The hook stops at the head of the second bundle, where it may, and
+	// re-enters. The run it starts is the one that suspends, so the hook is
+	// relaying: `ip` has to stay where that run stopped, and the hook's own
+	// bundle is reached later through its frame.
+	LIT(1);
+	shibe_asm_align(sasm);
+	shibe_cell_t second = shibe_asm_here(sasm);
+	suspend_at = (shibe_op_addr_t){ .bundle = second, .slot = 0 };
+	LIT(2);
+	EMIT(ADD);
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	shibe_asm_align(sasm);
+	shibe_cell_t after_call = shibe_asm_here(sasm);
+	LIT(100);
+	EMIT(DRP);
+	EMIT(RET);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 1);
+	// The nested run is what a resume picks up, so that is where `ip` points
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->ip.u32, after_call.u32);
+
+	// Resuming will report the hook's bundle again once the frame is finished
+	suspend_at = (shibe_op_addr_t){ 0 };
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	// Call 6 finished the frame, and neither half ran twice
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 2);
+	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	BTEST_EXPECT_EQUAL("%d", shibe_pop(vm).i32, 3);
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
+}
+
 BTEST(ssuspend, a_hook_may_not_stop_inside_a_bundle) {
 	test_host.debug = suspending_hook;
 

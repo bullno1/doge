@@ -240,8 +240,7 @@ shibe_host_call_end(
 	const shibe_host_call_t* call,
 	shibe_status_t status,
 	shibe_error_t error,
-	shibe_cell_t arg,
-	shibe_cell_t resume_ip
+	shibe_cell_t arg
 ) {
 	uint32_t host_fp = vm->hfp;
 	vm->hfp = call->saved_hfp;
@@ -284,15 +283,17 @@ shibe_host_call_end(
 				}
 				vm->at_continuation = true;
 			}
+			// Only now does `ip` become the resume point: while the callback
+			// was running it was the cursor, which is what it really was.
+			//
+			// A relayed suspension leaves `ip` alone. The run that stopped is
+			// underneath this call and has already written where it picks up;
+			// this call's own resume point is in the frame that run was
+			// started through, as its `outer_ip`. Overwriting it here would
+			// come back to the outer call site with the inner activation still
+			// on the stack.
+			vm->state.ip = call->resume_ip;
 		}
-		// Only now does `ip` become the resume point: while the callback was
-		// running it was the cursor, which is what it really was.
-		//
-		// `resume_ip` is read again here rather than reused from `begin`: for an
-		// EXTCALL it is `ip` itself, and a nested run that suspended underneath
-		// has already moved it to where that run stopped. Coming back to the
-		// outer call site instead would lose the inner activation.
-		vm->state.ip = resume_ip;
 		vm->state.exec_state = SHIBE_EXEC_SUSPENDED;
 		return SHIBE_SUSPENDED;
 	}
@@ -307,7 +308,7 @@ shibe_host_call_end(
 			shibe_host_call_begin(vm, (RESUME_IP), (CAN_SUSPEND)); \
 		shibe_status_t host_status_ = (CALL); \
 		host_status_ = shibe_host_call_end( \
-			vm, &call_, host_status_, (ERROR), (ARG), (RESUME_IP) \
+			vm, &call_, host_status_, (ERROR), (ARG) \
 		); \
 		if (host_status_ != SHIBE_OK) { return host_status_; } \
 		SHIBE_LOAD_STATE(vm, state); \
@@ -914,10 +915,7 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 		// from being made a second time
 		SHIBE_HOST_CALL(
 			host->extcall(host, vm, index),
-			// `vm->state.ip` rather than `state.ip`, because SHIBE_HOST_CALL
-			// reads this twice and the register file is only written back to
-			// the vm in between.
-			SHIBE_ERR_EXTCALL, index, vm->state.ip, true
+			SHIBE_ERR_EXTCALL, index, state.ip, true
 		);
 
 		SHIBE_NEXT_BUNDLE();
