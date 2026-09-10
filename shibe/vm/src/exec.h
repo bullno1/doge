@@ -73,15 +73,21 @@ shibe_mem_ref(shibe_vm_t* vm, shibe_cell_t addr) {
 	return index < bseg_len(*seg) ? bseg_ref(*seg, index) : NULL;
 }
 
-// A run of cells that plain indexing can reach, so that instruction fetch does
-// not pay for a full address resolution on every bundle and every immediate.
+// Cache the current span to reduce the cost of address translation.
 //
-// `addr` carries the region bits, so an address in another region falls out of
-// range on its own and no region check is needed on the fast path.
+// bseg is discontiguous so every instruction bundle fetch incurs a cost.
+//
+// pc is where the pc is at in host address space, it must be within [base, end).
+// Falling out means refilling.
+// [addr, addr+len) is the VM address space range.
+//
+// In the fast path, only `pc` and `end` are compared for every bundle fetch.
 typedef struct {
+	shibe_cell_t* pc;
+	shibe_cell_t* end;
+	shibe_cell_t* base;
 	uint32_t addr;
 	uint32_t len;
-	shibe_cell_t* base;
 } shibe_span_t;
 
 // Locate the span holding `addr`: its bseg segment, clipped to the region's
@@ -93,7 +99,8 @@ typedef struct {
 // being shorter than the region now is, which costs a re-locate and never a
 // wrong answer.
 //
-// Returns false when `addr` is out of bounds, leaving `span` untouched.
+// Returns false when `addr` is out of bounds, leaving `span` untouched;
+// otherwise the cursor is left on `addr`.
 static inline bool
 shibe_span_locate(shibe_vm_t* vm, shibe_cell_t addr, shibe_span_t* span) {
 	shibe_mem_seg_t* seg = &vm->regions[shibe_mem_region(addr)];
@@ -109,6 +116,8 @@ shibe_span_locate(shibe_vm_t* vm, shibe_cell_t addr, shibe_span_t* span) {
 	span->addr = addr.u32 - index + (uint32_t)base;
 	span->len = (uint32_t)(end - base);
 	span->base = bseg_ref(*seg, base);
+	span->end = span->base + span->len;
+	span->pc = span->base + (index - base);
 	return true;
 }
 
@@ -164,12 +173,58 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 		(vm)->state.exec_state = exec_state_; \
 	} while (0)
 
-#define SHIBE_FAULT(ERROR, ARG) \
-	do { \
-		SHIBE_SAVE_STATE(vm, state); \
-		shibe_panic(vm, &(shibe_panic_t){ .error = (ERROR), .arg = (ARG) }); \
-		return SHIBE_ERROR; \
-	} while (0)
+#if defined(__GNUC__) || defined(__clang__)
+#	define SHIBE_COLD __attribute__((noinline, cold))
+#	define SHIBE_LIKELY(X)   __builtin_expect(!!(X), 1)
+#	define SHIBE_UNLIKELY(X) __builtin_expect(!!(X), 0)
+#elif defined(_MSC_VER)
+#	define SHIBE_COLD __declspec(noinline)
+#	define SHIBE_LIKELY(X)   (X)
+#	define SHIBE_UNLIKELY(X) (X)
+#else
+#	define SHIBE_COLD
+#	define SHIBE_LIKELY(X)   (X)
+#	define SHIBE_UNLIKELY(X) (X)
+#endif
+
+// Fault reporting, keep out of the dispatch loop, not inlined.
+//
+// The registers travel as scalars rather than as `state`: handing the struct
+// over, by value or by address, makes the compiler keep a copy of it in
+// memory on the hot side, and the interpreter's local then lives there too.
+static SHIBE_COLD shibe_status_t
+shibe_exec_fault(
+	shibe_vm_t* vm,
+	shibe_error_t error,
+	shibe_cell_t arg,
+	shibe_cell_t ip,
+	shibe_cell_t dsp,
+	shibe_cell_t asp,
+	shibe_cell_t fp,
+	shibe_cell_t tp,
+	shibe_cell_t tm
+) {
+	vm->state.ip = ip;
+	vm->state.dsp = dsp;
+	vm->state.asp = asp;
+	vm->state.fp = fp;
+	vm->state.tp = tp;
+	vm->state.tm = tm;
+	shibe_panic(vm, &(shibe_panic_t){ .error = error, .arg = arg });
+	return SHIBE_ERROR;
+}
+
+// The address the execution cursor is on, recalculated from the span cache
+#define SHIBE_IP() \
+	((shibe_cell_t){ .u32 = span.addr + (uint32_t)(span.pc - span.base) })
+#define SHIBE_SYNC_IP() do { state.ip = SHIBE_IP(); } while (0)
+
+#define SHIBE_FAULT_AT(IP, ERROR, ARG) \
+	return shibe_exec_fault( \
+		vm, (ERROR), (ARG), (IP), \
+		state.dsp, state.asp, state.fp, state.tp, state.tm \
+	)
+#define SHIBE_FAULT(ERROR, ARG) SHIBE_FAULT_AT(SHIBE_IP(), (ERROR), (ARG))
 
 // Calls a host callback and makes what it returned mean something.
 //
@@ -311,6 +366,7 @@ shibe_host_call_end(
 
 #define SHIBE_HOST_CALL(CALL, ERROR, ARG, RESUME_IP, CAN_SUSPEND) \
 	do { \
+		SHIBE_SYNC_IP(); \
 		SHIBE_SAVE_STATE(vm, state); \
 		shibe_host_call_t call_ = \
 			shibe_host_call_begin(vm, 0, (RESUME_IP), (CAN_SUSPEND)); \
@@ -320,26 +376,32 @@ shibe_host_call_end(
 		); \
 		if (host_status_ != SHIBE_OK) { return host_status_; } \
 		SHIBE_LOAD_STATE(vm, state); \
+		SHIBE_JUMP(state.ip); \
 	} while (0)
 
-// Reads the cell `ip` names and steps over it.
-//
-// The span cache carries the common case: a subtract, an unsigned compare and
-// an indexed load. Only a fetch that leaves the cached span pays for the
-// segment lookup, and because the test is on the address rather than on a
-// walking pointer, a jump whose target is still in the span stays on the fast
-// path too.
+// Moves the cursor to `TARGET`. A target still inside the cached span is a
+// subtract and a compare; anything else re-locates.
+#define SHIBE_JUMP(TARGET) \
+	do { \
+		shibe_cell_t target_ = (TARGET); \
+		uint32_t off_ = target_.u32 - span.addr; \
+		if (SHIBE_LIKELY(off_ < span.len)) { \
+			span.pc = span.base + off_; \
+		} else if (!shibe_span_locate(vm, target_, &span)) { \
+			SHIBE_FAULT_AT(target_, SHIBE_ERR_MEM_FAULT, target_); \
+		} \
+	} while (0)
+
+// Reads the cell the cursor is on and steps over it.
 #define SHIBE_FETCH_IP(OUT) \
 	do { \
-		uint32_t off_ = state.ip.u32 - span.addr; \
-		if (off_ >= span.len) { \
-			if (!shibe_span_locate(vm, state.ip, &span)) { \
-				SHIBE_FAULT(SHIBE_ERR_MEM_FAULT, state.ip); \
+		if (SHIBE_UNLIKELY(span.pc == span.end)) { \
+			shibe_cell_t next_ = SHIBE_IP(); \
+			if (!shibe_span_locate(vm, next_, &span)) { \
+				SHIBE_FAULT_AT(next_, SHIBE_ERR_MEM_FAULT, next_); \
 			} \
-			off_ = state.ip.u32 - span.addr; \
 		} \
-		state.ip.u32 += 1; \
-		(OUT) = span.base[off_]; \
+		(OUT) = *span.pc++; \
 	} while (0)
 
 // Reads the operand cell the instruction stream is sitting on
@@ -429,10 +491,18 @@ shibe_host_call_end(
 #define SHIBE_OP(NAME)          shibe_op_ ## NAME:
 #define SHIBE_OP_DEFAULT(NAME)  shibe_op_ ## NAME:
 #define SHIBE_END_OP()          SHIBE_NEXT();
+// Keeps every handler's dispatch an indirect branch of its own.
+// An empty asm with a unique text prevents compilers (clang) from merging the
+// computed goto-s and incurs branch misprediction.
+#define SHIBE_STR_(X) #X
+#define SHIBE_STR(X)  SHIBE_STR_(X)
+#define SHIBE_DISPATCH_PIN(OPCODE) \
+	__asm__ volatile("# dispatch " SHIBE_STR(__COUNTER__) : "+r"(OPCODE), "+r"(win))
 #define SHIBE_NEXT() \
 	do { \
 		uint8_t opcode = (uint8_t)win; win >>= 8; \
 		SHIBE_TRACE_STEP(); \
+		SHIBE_DISPATCH_PIN(opcode); \
 		goto *dispatch[opcode]; \
 	} while (0)
 #define SHIBE_NEXT_BUNDLE()     do { SHIBE_REFILL(); SHIBE_NEXT(); } while (0)
@@ -547,7 +617,7 @@ shibe_host_call_end(
 
 #if SHIBE_HAS_HOOK
 #	define SHIBE_TRACE_DECL()   shibe_op_addr_t at = { 0 };
-#	define SHIBE_TRACE_REFILL() do { at.bundle = state.ip; at.slot = 0xff; } while (0)
+#	define SHIBE_TRACE_REFILL() do { at.bundle = SHIBE_IP(); at.slot = 0xff; } while (0)
 // The window bootstraps on a synthetic SHIBE_OP_ENDB, and every bundle ends on
 // one. Neither is an instruction, so neither is reported.
 //
@@ -612,10 +682,11 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 	// boundary.
 	uint64_t win = SHIBE_OP_ENDB;
 
-	// Where instruction fetch is reading from. A zero span has no cells in it,
-	// so the first fetch of the run always goes and locates one. A resume gets a
-	// fresh one for the same reason: it re-enters here with the span empty.
+	// Cache the range of instruction straight line code would run.
 	shibe_span_t span = { 0 };
+	if (!shibe_span_locate(vm, state.ip, &span)) {
+		SHIBE_FAULT_AT(state.ip, SHIBE_ERR_MEM_FAULT, state.ip);
+	}
 
 	SHIBE_TRACE_DECL();
 
@@ -629,7 +700,7 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 	SHIBE_OP(JMP) {
 		shibe_cell_t target;
 		SHIBE_IMM(target);
-		state.ip = target;
+		SHIBE_JUMP(target);
 		SHIBE_NEXT_BUNDLE();
 	}
 
@@ -639,7 +710,7 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 		SHIBE_DS_NEED(1);
 		shibe_cell_t cond = SHIBE_DS(0);
 		SHIBE_DS_DROP(1);
-		if (cond.u32 == 0) { state.ip = target; }
+		if (cond.u32 == 0) { SHIBE_JUMP(target); }
 		SHIBE_NEXT_BUNDLE();
 	}
 
@@ -648,10 +719,8 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 		SHIBE_AS_ROOM(1);
 		shibe_cell_t target = SHIBE_DS(0);
 		SHIBE_DS_DROP(1);
-		// Nothing follows a control transfer in a bundle, so `ip` is already
-		// the address of the next instruction
-		SHIBE_AS_PUSH(state.ip);
-		state.ip = target;
+		SHIBE_AS_PUSH(SHIBE_IP());
+		SHIBE_JUMP(target);
 		SHIBE_NEXT_BUNDLE();
 	}
 
@@ -662,19 +731,20 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 		SHIBE_DS_DROP(2);
 		if (cond.u32 != 0) {
 			SHIBE_AS_ROOM(1);
-			SHIBE_AS_PUSH(state.ip);
-			state.ip = target;
+			SHIBE_AS_PUSH(SHIBE_IP());
+			SHIBE_JUMP(target);
 		}
 		SHIBE_NEXT_BUNDLE();
 	}
 
 	SHIBE_OP(RET) {
 		SHIBE_AS_NEED(1);
-		state.ip = SHIBE_AS_POP();
+		SHIBE_JUMP(SHIBE_AS_POP());
 		SHIBE_NEXT_BUNDLE();
 	}
 
 	SHIBE_OP(HALT) {
+		SHIBE_SYNC_IP();
 		SHIBE_SAVE_STATE(vm, state);
 		vm->state.exec_state = SHIBE_EXEC_IDLE;
 		return SHIBE_OK;
@@ -852,7 +922,7 @@ SHIBE_VM_EXECUTE(shibe_vm_t* vm) {
 	SHIBE_OP(ENTER) {
 		// The operand cell doubles as the frame's creator: it names the code
 		// that built the frame, and the slot count reads back from it
-		shibe_cell_t creator = state.ip;
+		shibe_cell_t creator = SHIBE_IP();
 		shibe_cell_t num_slots;
 		SHIBE_IMM(num_slots);
 
