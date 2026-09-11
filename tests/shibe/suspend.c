@@ -1209,6 +1209,199 @@ BTEST(ssuspend, a_run_that_halts_untidily_still_finds_its_host_frame) {
 	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
 }
 
+BTEST(ssuspend, freeing_a_frame_under_a_suspended_run_is_rejected) {
+	test_host.extcall = suspending_extcall;
+
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+	BTEST_ASSERT(shibe_asm_end(sasm));
+
+	shibe_frame_t frame = shibe_alloc_frame(vm, 1);
+	shibe_set_continuation(vm, frame, (shibe_cell_t){ .u32 = 5 });
+	uint32_t asp = shibe_inspect(vm)->asp.u32;
+
+	BTEST_ASSERT_EQUAL("%d", shibe_execute(vm, code), SHIBE_SUSPENDED);
+
+	// The run stands on that frame and will come back to it, so it is not the
+	// host's to take away in between
+	shibe_free_frame(vm, frame);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, asp);
+}
+
+// Call 1 re-enters, call 2 stops the run it started, and call 1 then tries to
+// pick that run up from where it stands
+static shibe_status_t
+resuming_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host;
+	++num_extcalls;
+	if (index.u32 != 1) { return SHIBE_SUSPENDED; }
+
+	shibe_frame_t frame = shibe_alloc_frame(called, 0);
+	shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 3 });
+	shibe_status_t status = shibe_execute(called, nested_entry);
+	if (status != SHIBE_SUSPENDED) { return status; }
+	return shibe_resume(called);
+}
+
+BTEST(ssuspend, resuming_from_inside_a_callback_is_rejected) {
+	test_host.extcall = resuming_extcall;
+
+	// The callback sees a suspended vm, the same as the host would, but the run
+	// it interrupted is still underneath it on the C stack. A resume from there
+	// would carry that run on inside the callback and again after it returned.
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub);
+	EMIT(CALL);
+	EMIT(HALT);
+
+	shibe_asm_bind_label(sasm, sub);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT(RET);
+
+	BTEST_EXPECT_EQUAL("%d", run(), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	// Call 3, the continuation, never ran
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 2);
+}
+
+BTEST(ssuspend, a_resumed_nested_run_has_to_hand_the_stack_back) {
+	test_host.extcall = continuing_extcall;
+
+	// The same stub without the stop is caught by shibe_execute. Stopping on
+	// the way must not buy it a pass: the frame underneath is still put back
+	// from what the stub left, and a stray frame would be dropped on the floor.
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT(HALT);
+
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT_IMM(ENTER, ((shibe_cell_t){ .u32 = 0 }));
+	EMIT(HALT);
+
+	BTEST_ASSERT_EQUAL("%d", run(), SHIBE_SUSPENDED);
+	BTEST_ASSERT_EQUAL("%d", num_panics, 0);
+
+	BTEST_EXPECT_EQUAL("%d", shibe_resume(vm), SHIBE_ERROR);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 1);
+	BTEST_EXPECT(last_panic.error == SHIBE_ERR_INVALID);
+	// Call 3, the continuation, never ran
+	BTEST_EXPECT_EQUAL("%d", num_extcalls, 2);
+}
+
+// Every call and second half, in the order it ran, so that an interleaving of
+// host and vm activations can be checked as a sequence
+static uint32_t call_order[16];
+static int num_calls;
+
+// Host -> A -> B -> A2 -> C -> A3 -> leaf. Call 1 is B and call 2 is C, each
+// re-entering under a frame; call 3 is the leaf that stops. 1x is the second
+// half of x: C's re-enters again and that run stops too, B's stops on its own.
+// 2x marks that a run carried on past its call, and 30 is the host's own
+// second half.
+static shibe_status_t
+interleaving_extcall(shibe_host_t* host, shibe_vm_t* called, shibe_cell_t index) {
+	(void)host;
+	++num_extcalls;
+	if (num_calls < 16) { call_order[num_calls] = index.u32; }
+	++num_calls;
+
+	shibe_frame_t frame;
+	switch (index.u32) {
+		case 1:
+			frame = shibe_alloc_frame(called, 0);
+			shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 11 });
+			return shibe_execute(called, nested_entry);
+		case 2:
+			frame = shibe_alloc_frame(called, 0);
+			shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 12 });
+			return shibe_execute(called, deferred_entry);
+		case 3:
+			return SHIBE_SUSPENDED;
+		case 12:
+			frame = shibe_get_frame(called);
+			shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 13 });
+			return shibe_execute(called, deferred_entry);
+		case 11:
+			frame = shibe_get_frame(called);
+			shibe_set_continuation(called, frame, (shibe_cell_t){ .u32 = 14 });
+			return SHIBE_SUSPENDED;
+		default:
+			return SHIBE_OK;
+	}
+}
+
+BTEST(ssuspend, interleaved_host_and_vm_activations_unwind_innermost_first) {
+	test_host.extcall = interleaving_extcall;
+	num_calls = 0;
+
+	// A
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 1 }));
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 20 }));
+	EMIT(HALT);
+
+	// A2, run by B
+	shibe_asm_align(sasm);
+	nested_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub2 = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub2);
+	EMIT(CALL);
+	EMIT(HALT);
+	shibe_asm_bind_label(sasm, sub2);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 2 }));
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 21 }));
+	EMIT(RET);
+
+	// A3, run by C and again by C's second half
+	shibe_asm_align(sasm);
+	deferred_entry = shibe_asm_here(sasm);
+	shibe_asm_label_t sub3 = shibe_asm_make_label(sasm);
+	EMIT_LABEL(LIT, sub3);
+	EMIT(CALL);
+	EMIT(HALT);
+	shibe_asm_bind_label(sasm, sub3);
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 3 }));
+	EMIT_IMM(EXTCALL, ((shibe_cell_t){ .u32 = 22 }));
+	EMIT(RET);
+	BTEST_ASSERT(shibe_asm_end(sasm));
+
+	// The host itself holds a frame under all of it
+	shibe_frame_t frame = shibe_alloc_frame(vm, 0);
+	shibe_set_continuation(vm, frame, (shibe_cell_t){ .u32 = 30 });
+
+	BTEST_ASSERT_EQUAL("%d", shibe_execute(vm, code), SHIBE_SUSPENDED);
+	// A3 finishes, C's second half re-enters A3, which stops again
+	BTEST_ASSERT_EQUAL("%d", shibe_resume(vm), SHIBE_SUSPENDED);
+	// A3 finishes, C's frame is done, A2 carries on and halts, B's second
+	// half stops on its own
+	BTEST_ASSERT_EQUAL("%d", shibe_resume(vm), SHIBE_SUSPENDED);
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->ip.u32, 0u);
+	// B's frame is done, A carries on and halts, the host's frame is done
+	BTEST_ASSERT_EQUAL("%d", shibe_resume(vm), SHIBE_OK);
+	BTEST_EXPECT_EQUAL("%d", num_panics, 0);
+	BTEST_EXPECT(shibe_inspect(vm)->exec_state == SHIBE_EXEC_IDLE);
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->asp.u32, 0u);
+
+	static const uint32_t want[] = {
+		1, 2, 3,
+		22, 12, 3,
+		22, 13, 21, 11,
+		14, 20, 30,
+	};
+	BTEST_ASSERT_EQUAL("%d", num_calls, (int)(sizeof(want) / sizeof(want[0])));
+	for (int i = 0; i < num_calls; ++i) {
+		BTEST_EXPECT_EQUAL("%u", call_order[i], want[i]);
+	}
+}
+
 BTEST(ssuspend, nested_extcall_suspension_is_rejected) {
 	test_host.extcall = nested_suspending_extcall;
 
@@ -1299,6 +1492,8 @@ BTEST(ssuspend, host_call_can_suspend_after_its_nested_run_finished) {
 	// The nested run gave its activation back, but the frame is the host call's
 	// and that call has not finished
 	BTEST_EXPECT_EQUAL("%u", depth(), 1u);
+	// There is no run to pick up, and `ip` says so
+	BTEST_EXPECT_EQUAL("%u", shibe_inspect(vm)->ip.u32, 0u);
 
 	// The continuation pushes the 5 the first half never got to, and only then
 	// does the interrupted run carry on into its ADD

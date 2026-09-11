@@ -99,7 +99,10 @@ shibe_destroy(shibe_vm_t* vm) {
 
 void
 shibe_reset(shibe_vm_t* vm) {
-	if (vm->state.exec_state == SHIBE_EXEC_RUNNING) {
+	// An activation is still on the C stack, so a reset here would hand the
+	// interpreter back a register file belonging to nothing when its callback
+	// returns
+	if (vm->depth != 0) {
 		shibe_panic(vm, &(shibe_panic_t){
 			.error = SHIBE_ERR_INVALID,
 		});
@@ -114,10 +117,9 @@ shibe_reset(shibe_vm_t* vm) {
 	vm->state.tm = SHIBE_ZERO;
 
 	vm->state.exec_state = SHIBE_EXEC_IDLE;
-	// The activation they belonged to is gone, so there is nothing to come back
-	// to and no host call left owning a frame. Nothing is running either, so a
-	// suspension has somewhere to come back to again.
-	vm->at_continuation = false;
+	// The activation they belonged to is gone, so no host call is left owning a
+	// frame. Nothing is running either, so a suspension has somewhere to come
+	// back to again.
 	vm->hfp = 0;
 	vm->can_suspend = true;
 }
@@ -352,7 +354,19 @@ shibe_close_host_frame(shibe_vm_t* vm, uint32_t fp) {
 	uint32_t base = fp - SHIBE_AUX_HOST_HEADER_LEN;
 	vm->state.fp = vm->state.as[base + 4];
 	vm->state.asp.u32 = base;
-	vm->hfp = 0;
+	// A frame the host itself holds is named by `hfp` until it goes. One a
+	// callback held was let go of when that call ended.
+	if (vm->hfp == fp) { vm->hfp = 0; }
+}
+
+// Whether the auxiliary stack is exactly as the host frame at `fp` left it:
+// that frame on top, nothing above. A run started under a host frame has to
+// hand it back this way, because the run underneath is put back from the frame
+// and anything left standing above it would be silently dropped.
+static bool
+shibe_host_frame_is_top(shibe_vm_t* vm, uint32_t fp) {
+	uint32_t num_locals = vm->state.as[fp + SHIBE_AUX_HOST_NUM_LOCALS].u32;
+	return vm->state.fp.u32 == fp && vm->state.asp.u32 == fp + num_locals;
 }
 
 // Whether the frame directly below `fp` is a host frame. `creator` is 0 for one
@@ -451,11 +465,12 @@ void
 shibe_free_frame(shibe_vm_t* vm, shibe_frame_t frame) {
 	if (!shibe_check_frame(vm, frame)) { return; }
 
-	// Only a frame taken outside a callback is the host's to hand back. The vm
-	// takes a callback's own back when it returns, and letting the callback do
-	// it first would leave that restore working from a frame that is no longer
-	// there.
-	if (vm->state.exec_state == SHIBE_EXEC_RUNNING) {
+	// Only a frame taken outside any activation is the host's to hand back. The
+	// vm takes a callback's own back when it returns, and letting the callback
+	// do it first would leave that restore working from a frame that is no
+	// longer there; a suspended run still stands on one taken before it
+	// started, and would come back to a stack pulled out from under it.
+	if (vm->state.exec_state != SHIBE_EXEC_IDLE) {
 		shibe_panic(vm, &(shibe_panic_t){
 			.error = SHIBE_ERR_INVALID,
 		});
@@ -526,13 +541,13 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	}
 
 	uint32_t frame = vm->hfp;
-	uint32_t frame_asp = vm->state.asp.u32;
-	shibe_cell_t frame_fp = vm->state.fp;
 
 	vm->state.ip = addr;
 	vm->state.exec_state = SHIBE_EXEC_RUNNING;
 
+	++vm->depth;
 	shibe_status_t status = shibe_run(vm);
+	--vm->depth;
 
 	if (status == SHIBE_SUSPENDED) {
 		// A frame that outlives the suspension needs somebody to finish it:
@@ -555,7 +570,7 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 	} else if (status == SHIBE_OK && nested) {
 		// The entry point has to be a stub that halts, so it must give the
 		// auxiliary stack back exactly as it found it
-		if (vm->state.asp.u32 != frame_asp || vm->state.fp.u32 != frame_fp.u32) {
+		if (!shibe_host_frame_is_top(vm, frame)) {
 			shibe_panic(vm, &(shibe_panic_t){
 				.error = SHIBE_ERR_INVALID,
 			});
@@ -565,145 +580,6 @@ shibe_execute(shibe_vm_t* vm, shibe_cell_t addr) {
 			// still ongoing, and the callback site takes it back on the way out.
 			vm->state.exec_state = SHIBE_EXEC_RUNNING;
 		}
-	}
-
-	return status;
-}
-
-// Finishes one orphaned host frame: its call frame returned on the way out of
-// the suspension, so the continuation runs in place of the rest of it, with the
-// frame current so it reads back whatever the first half stored.
-static shibe_status_t
-shibe_call_continuation(shibe_vm_t* vm, uint32_t fp, shibe_cell_t continuation) {
-	shibe_host_t* host = vm->config.host;
-	if (host->extcall == NULL) {
-		shibe_panic(vm, &(shibe_panic_t){
-			.error = SHIBE_ERR_UNBOUND,
-			.arg = continuation,
-		});
-		return SHIBE_ERROR;
-	}
-
-	// Being called consumes it. A second half that means to stop again, or to
-	// start a run that might, has to name the next one out loud rather than
-	// inherit the one that brought it here: that value was chosen for a
-	// suspension that has already been dealt with, so acting on it again is a
-	// bug every time.
-	vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION] = SHIBE_ZERO;
-
-	vm->hfp = fp;
-	vm->state.exec_state = SHIBE_EXEC_RUNNING;
-	shibe_status_t status = host->extcall(host, vm, continuation);
-	vm->hfp = 0;
-
-	// A callback that panicked the vm from underneath keeps its own reason,
-	// exactly as one reached from the interpreter does
-	if (shibe_panicked(vm)) { return SHIBE_ERROR; }
-
-	if (status == SHIBE_ERROR) {
-		shibe_panic(vm, &(shibe_panic_t){
-			.error = SHIBE_ERR_EXTCALL,
-			.arg = continuation,
-		});
-		return SHIBE_ERROR;
-	}
-
-	return status;
-}
-
-shibe_status_t
-shibe_resume(shibe_vm_t* vm) {
-	if (shibe_panicked(vm)) {
-		return SHIBE_ERROR;
-	}
-
-	// Only a suspended run has somewhere to come back to. An idle vm has no
-	// activation at all, and a running one is already inside the interpreter.
-	if (vm->state.exec_state != SHIBE_EXEC_SUSPENDED) {
-		shibe_panic(vm, &(shibe_panic_t){
-			.error = SHIBE_ERR_INVALID,
-		});
-		return SHIBE_ERROR;
-	}
-
-	// Whatever the host did to the vm in the meantime stands: the registers and
-	// both stacks are read back as they are now, which is how an extcall that
-	// suspended leaves its result behind. Nothing stops anywhere but a bundle
-	// boundary, so `ip` is the whole of where an interrupted run picks up and
-	// starting it again is an ordinary run.
-	shibe_status_t status;
-	if (vm->at_continuation) {
-		// A callback was the one that stopped, after whatever it ran had already
-		// finished, so there is no run to pick up: go straight to its frame
-		vm->at_continuation = false;
-		status = SHIBE_OK;
-	} else {
-		vm->state.exec_state = SHIBE_EXEC_RUNNING;
-		status = shibe_run(vm);
-	}
-
-	// Every host frame still standing was orphaned by the suspension. Nothing
-	// is running underneath them, so each one is finished here, innermost
-	// first, and the run below it carried on.
-	while (status == SHIBE_OK) {
-		// Everything above the innermost host frame died with the run that
-		// halted, so frames that run left behind - which nothing stops a top
-		// level one from doing - must not hide the call underneath them. The
-		// chain strictly descends, and anything else is not one to follow.
-		uint32_t fp = vm->state.fp.u32;
-		while (fp != 0 && !shibe_is_host_frame(vm, fp)) {
-			uint32_t below = fp >= SHIBE_AUX_HEADER_LEN
-				? vm->state.as[fp - 3].u32
-				: 0;
-			fp = below < fp ? below : 0;
-		}
-		if (fp == 0) { break; }
-
-		shibe_cell_t continuation = vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION];
-		if (continuation.u32 == 0) {
-			// Every frame the unwind reaches was orphaned by the suspension,
-			// and one that named nothing could not have suspended in the first
-			// place, so this is a frame nothing can take back
-			shibe_panic(vm, &(shibe_panic_t){
-				.error = SHIBE_ERR_NOT_SUSPENDABLE,
-				.arg = { .u32 = fp },
-			});
-			return SHIBE_ERROR;
-		}
-
-		shibe_cell_t outer_ip = vm->state.as[fp + SHIBE_AUX_HOST_OUTER_IP];
-
-		status = shibe_call_continuation(vm, fp, continuation);
-		if (status == SHIBE_ERROR) { return SHIBE_ERROR; }
-		if (status == SHIBE_SUSPENDED) {
-			if (vm->state.exec_state != SHIBE_EXEC_SUSPENDED) {
-				// It stopped on its own, not relaying the result so it must have
-				// a frame with continuation
-				if (vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION].u32 == 0) {
-					shibe_panic(vm, &(shibe_panic_t){
-						.error = SHIBE_ERR_NOT_SUSPENDABLE,
-						.arg = { .u32 = fp },
-					});
-					return SHIBE_ERROR;
-				}
-				vm->at_continuation = true;
-			}
-			vm->state.exec_state = SHIBE_EXEC_SUSPENDED;
-			return SHIBE_SUSPENDED;
-		}
-
-		shibe_close_host_frame(vm, fp);
-
-		if (outer_ip.u32 == 0) {
-			// A frame a top level call opened: there is no run underneath it,
-			// so finishing it finishes everything
-			vm->state.exec_state = SHIBE_EXEC_IDLE;
-			break;
-		}
-
-		vm->state.ip = outer_ip;
-		vm->state.exec_state = SHIBE_EXEC_RUNNING;
-		status = shibe_run(vm);
 	}
 
 	return status;
@@ -727,3 +603,156 @@ shibe_resume(shibe_vm_t* vm) {
 #define SHIBE_VM_EXECUTE shibe_execute_with_hook
 #define SHIBE_HAS_HOOK 1
 #include "exec.h"
+
+// Everything from here on uses the host call site the interpreter defines,
+// so it sits below the include.
+
+// Finishes one host frame a suspension orphaned. The C call that held it
+// returned on the way out, so its continuation runs in place of the rest of it,
+// with the frame in front of it so it reads back whatever the first half
+// stored. It is a host call like any other and ends through the same site, so
+// what it returns means exactly what it would have from the interpreter.
+static shibe_status_t
+shibe_call_continuation(shibe_vm_t* vm, uint32_t fp) {
+	shibe_host_t* host = vm->config.host;
+	shibe_cell_t* slot = &vm->state.as[fp + SHIBE_AUX_HOST_CONTINUATION];
+	shibe_cell_t continuation = *slot;
+	if (continuation.u32 == 0) {
+		// Every frame the unwind reaches was orphaned by the suspension, and
+		// one that named nothing could not have let it through, so this is a
+		// frame nothing can take back
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_NOT_SUSPENDABLE,
+			.arg = { .u32 = fp },
+		});
+		return SHIBE_ERROR;
+	}
+	if (host->extcall == NULL) {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_UNBOUND,
+			.arg = continuation,
+		});
+		return SHIBE_ERROR;
+	}
+
+	// Being called consumes it. A second half that means to stop again, or to
+	// start a run that might, has to name the next one out loud rather than
+	// inherit the one that brought it here: that value was chosen for a
+	// suspension that has already been dealt with, so acting on it again is a
+	// bug every time.
+	*slot = SHIBE_ZERO;
+
+	// The run underneath is the one the frame records. A continuation never
+	// opens a frame of its own - it already has this one - so that is read
+	// only by a walker, but it is the truth all the same.
+	shibe_cell_t outer_ip = vm->state.as[fp + SHIBE_AUX_HOST_OUTER_IP];
+	vm->state.exec_state = SHIBE_EXEC_RUNNING;
+	shibe_host_call_t call = shibe_host_call_begin(vm, fp, outer_ip, true);
+	shibe_status_t status = host->extcall(host, vm, continuation);
+	return shibe_host_call_end(vm, &call, status, SHIBE_ERR_EXTCALL, continuation);
+}
+
+// The innermost host frame still standing, or 0. Everything above it died with
+// the run that halted: nothing makes a top level run balance its frames before
+// halting, so ones it left must not hide the call underneath them. The chain
+// strictly descends, and anything else is not one to follow.
+static uint32_t
+shibe_innermost_host_frame(shibe_vm_t* vm) {
+	uint32_t fp = vm->state.fp.u32;
+	while (fp != 0 && !shibe_is_host_frame(vm, fp)) {
+		uint32_t below = fp >= SHIBE_AUX_HEADER_LEN
+			? vm->state.as[fp - 3].u32
+			: 0;
+		fp = below < fp ? below : 0;
+	}
+	return fp;
+}
+
+// Picks a suspended vm up. Every host frame still standing was orphaned by the
+// suspension and nothing is running underneath any of them, so each one is
+// finished here, innermost first, and the run below it carried on.
+static shibe_status_t
+shibe_unwind(shibe_vm_t* vm) {
+	// Whatever the host did to the vm in the meantime stands: the registers and
+	// both stacks are read back as they are now, which is how an extcall that
+	// suspended leaves its result behind. Nothing stops anywhere but a bundle
+	// boundary, so `ip` is the whole of where an interrupted run picks up and
+	// starting it again is an ordinary run. An `ip` of 0 says there is none: a
+	// callback was what stopped, after whatever it ran had finished, so the
+	// resume begins with its frame.
+	shibe_status_t status = SHIBE_OK;
+	if (vm->state.ip.u32 != 0) {
+		vm->state.exec_state = SHIBE_EXEC_RUNNING;
+		status = shibe_run(vm);
+	}
+
+	while (status == SHIBE_OK) {
+		uint32_t fp = shibe_innermost_host_frame(vm);
+		if (fp == 0) {
+			// Nothing left to finish and nothing left to run
+			vm->state.exec_state = SHIBE_EXEC_IDLE;
+			break;
+		}
+
+		// A frame with a run underneath was opened by a callback, and the run
+		// that just halted was started under it by shibe_execute, so it owes
+		// the same tidiness it would have owed had it never stopped
+		shibe_cell_t outer_ip = vm->state.as[fp + SHIBE_AUX_HOST_OUTER_IP];
+		if (outer_ip.u32 != 0 && !shibe_host_frame_is_top(vm, fp)) {
+			shibe_panic(vm, &(shibe_panic_t){
+				.error = SHIBE_ERR_INVALID,
+			});
+			return SHIBE_ERROR;
+		}
+
+		status = shibe_call_continuation(vm, fp);
+		if (status != SHIBE_OK) { return status; }
+
+		shibe_close_host_frame(vm, fp);
+
+		if (outer_ip.u32 == 0) {
+			// A frame a top level call opened: there is no run underneath it,
+			// so finishing it finishes everything
+			vm->state.exec_state = SHIBE_EXEC_IDLE;
+			break;
+		}
+
+		vm->state.ip = outer_ip;
+		vm->state.exec_state = SHIBE_EXEC_RUNNING;
+		status = shibe_run(vm);
+	}
+
+	return status;
+}
+
+shibe_status_t
+shibe_resume(shibe_vm_t* vm) {
+	if (shibe_panicked(vm)) {
+		return SHIBE_ERROR;
+	}
+
+	// Only a suspended run has somewhere to come back to. An idle vm has no
+	// activation at all, and a running one is already inside the interpreter.
+	if (vm->state.exec_state != SHIBE_EXEC_SUSPENDED) {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_INVALID,
+		});
+		return SHIBE_ERROR;
+	}
+
+	// A callback whose nested run stopped sees a suspended vm too, but a resume
+	// from in there would carry the run that callback interrupted on
+	// underneath it, and then once more when the callback returned. Only the
+	// host, outside every activation, gets to.
+	if (vm->depth != 0) {
+		shibe_panic(vm, &(shibe_panic_t){
+			.error = SHIBE_ERR_INVALID,
+		});
+		return SHIBE_ERROR;
+	}
+
+	++vm->depth;
+	shibe_status_t status = shibe_unwind(vm);
+	--vm->depth;
+	return status;
+}

@@ -232,7 +232,9 @@ shibe_alloc_frame(shibe_vm_t* vm, uint32_t num_locals);
  * Release a frame allocated outside of a callback.
  *
  * Only needed for a host function that allocated one outside of a callback
- * and did not suspend.
+ * and did not suspend. Anything but an idle vm panics with `SHIBE_ERR_INVALID`:
+ * a callback's frame is taken back by the vm when the callback returns, and a
+ * suspended run still stands on one taken before it started.
  */
 SHIBE_API void
 shibe_free_frame(shibe_vm_t* vm, shibe_frame_t frame);
@@ -303,9 +305,15 @@ shibe_get_local(shibe_vm_t* vm, shibe_frame_t frame, uint32_t index);
  *   second time, so a hook that stops on a condition has to account for having
  *   just been resumed past it.
  *
+ * While suspended, `ip` is where the run picks up, or 0 when a host call was
+ * what stopped: there is no run to pick up then, and the resume starts by
+ * calling that call's continuation.
+ *
  * Anything other than a suspended vm panics with `SHIBE_ERR_INVALID`: an idle
  * one has no execution to continue, a halted run is over for good, and a running
- * one is already inside the interpreter. A panicked vm returns `SHIBE_ERROR`
+ * one is already inside the interpreter. So does a resume made from inside a
+ * host callback, even one whose nested run is what suspended: only the host,
+ * outside every activation, can resume. A panicked vm returns `SHIBE_ERROR`
  * without panicking again, like @ref shibe_execute.
  */
 SHIBE_API shibe_status_t

@@ -65,10 +65,11 @@ struct shibe_vm_s {
 	// hook is shown the vm as it really is.
 	shibe_cell_t resume_ip;
 
-	// Set when a callback stopped after whatever it ran had already finished.
-	// There is no run to pick up in that case: the resume starts by finishing
-	// that callback's frame through its continuation.
-	bool at_continuation;
+	// How many activations of the interpreter are on the C stack: every
+	// shibe_execute and shibe_resume counts itself while it is in. A callback
+	// always runs under at least one, which is what keeps it from resuming or
+	// resetting the vm out from under the run it interrupted.
+	uint32_t depth;
 
 	void* snapshot;
 };

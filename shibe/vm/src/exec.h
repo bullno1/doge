@@ -174,11 +174,12 @@ shibe_srem(int32_t lhs, int32_t rhs) {
 // Calls a host callback and makes what it returned mean something.
 //
 // The callback runs with the vm's registers written back, so it can reach in
-// through the public api, and with an activation of its own: `hfp` starts empty,
-// so a frame it opens is its own rather than its caller's. Anything it left on
-// the auxiliary stack belongs to that call, so a callback that returns normally
-// has it taken back here. A suspension or a panic keeps it: the frame is what a
-// resume finishes the call through, and what a stack walker reads afterwards.
+// through the public api, and with an activation of its own: `hfp` is the frame
+// it runs with, none for a call made from the interpreter, so one it opens is
+// its own rather than its caller's, and the frame being finished for a
+// continuation. Anything it left on the auxiliary stack belongs to that call,
+// so a callback that returns normally has it released here. A suspension or a
+// panic keeps it.
 //
 // The callback may have failed on its own, or it may be relaying something that
 // was already raised on this vm from underneath it: by a nested shibe_execute,
@@ -210,7 +211,9 @@ typedef struct {
 } shibe_host_call_t;
 
 static inline shibe_host_call_t
-shibe_host_call_begin(shibe_vm_t* vm, shibe_cell_t resume_ip, bool can_suspend) {
+shibe_host_call_begin(
+	shibe_vm_t* vm, uint32_t hfp, shibe_cell_t resume_ip, bool can_suspend
+) {
 	shibe_host_call_t call = {
 		.saved_ip = vm->state.ip,
 		.saved_fp = vm->state.fp,
@@ -221,7 +224,7 @@ shibe_host_call_begin(shibe_vm_t* vm, shibe_cell_t resume_ip, bool can_suspend) 
 		.resume_ip = resume_ip,
 		.can_suspend = can_suspend,
 	};
-	vm->hfp = 0;
+	vm->hfp = hfp;
 	vm->resume_ip = resume_ip;
 	vm->can_suspend = can_suspend;
 	return call;
@@ -281,19 +284,24 @@ shibe_host_call_end(
 					});
 					return SHIBE_ERROR;
 				}
-				vm->at_continuation = true;
+				// The call is what stopped, after whatever it ran had finished,
+				// so there is no run to pick up: a resume starts with this
+				// frame. Address 0 is reserved, so an `ip` of 0 says exactly
+				// that, the same way a frame's `outer_ip` of 0 says nothing
+				// runs underneath it.
+				vm->state.ip = SHIBE_ZERO;
+			} else {
+				// Only now does `ip` become the resume point: while the
+				// callback was running it was the cursor, which is what it
+				// really was
+				vm->state.ip = call->resume_ip;
 			}
-			// Only now does `ip` become the resume point: while the callback
-			// was running it was the cursor, which is what it really was.
-			//
-			// A relayed suspension leaves `ip` alone. The run that stopped is
-			// underneath this call and has already written where it picks up;
-			// this call's own resume point is in the frame that run was
-			// started through, as its `outer_ip`. Overwriting it here would
-			// come back to the outer call site with the inner activation still
-			// on the stack.
-			vm->state.ip = call->resume_ip;
 		}
+		// A relayed suspension leaves `ip` alone. The run that stopped is
+		// underneath this call and has already written where it picks up; this
+		// call's own resume point is in the frame that run was started through,
+		// as its `outer_ip`. Overwriting it here would come back to the outer
+		// call site with the inner activation still on the stack.
 		vm->state.exec_state = SHIBE_EXEC_SUSPENDED;
 		return SHIBE_SUSPENDED;
 	}
@@ -305,7 +313,7 @@ shibe_host_call_end(
 	do { \
 		SHIBE_SAVE_STATE(vm, state); \
 		shibe_host_call_t call_ = \
-			shibe_host_call_begin(vm, (RESUME_IP), (CAN_SUSPEND)); \
+			shibe_host_call_begin(vm, 0, (RESUME_IP), (CAN_SUSPEND)); \
 		shibe_status_t host_status_ = (CALL); \
 		host_status_ = shibe_host_call_end( \
 			vm, &call_, host_status_, (ERROR), (ARG) \
